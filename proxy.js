@@ -911,6 +911,39 @@ io.on('connection', function (socket) {
     if (typeof ack === 'function') ack({ ok: true, ...result });
   });
 
+  socket.on('setHqTerritory', function (payload, ack) {
+    if (!requirePrivilegedAccess(socket, ack, 'setHqTerritory')) return;
+    if (!allowEventRate(socket, 'setHqTerritory')) {
+      if (typeof ack === 'function') ack({ ok: false, error: 'Too many requests. Try again shortly.' });
+      return;
+    }
+    const roomId = socket.data.roomId;
+    const room = roomId ? rooms.get(roomId) : null;
+    if (!room) {
+      if (typeof ack === 'function') ack({ ok: false, error: 'Not in a room.' });
+      return;
+    }
+    if (room.status !== 'prep' && room.status !== 'playing') {
+      if (typeof ack === 'function') ack({ ok: false, error: 'HQ can only be changed during prep/playing.' });
+      return;
+    }
+    const role = roleForSocket(room, socket.id);
+    if (role !== 'defender') {
+      if (typeof ack === 'function') ack({ ok: false, error: 'Only defender can set HQ.' });
+      return;
+    }
+    const territoryName = payload && typeof payload.territoryName === 'string'
+      ? payload.territoryName.trim()
+      : '';
+    if (!territoryName || room.selectedTerritories.indexOf(territoryName) === -1) {
+      if (typeof ack === 'function') ack({ ok: false, error: 'HQ must be one of defender selected territories.' });
+      return;
+    }
+    room.hqTerritory = territoryName;
+    emitRoomState(roomId);
+    if (typeof ack === 'function') ack({ ok: true, hqTerritory: room.hqTerritory });
+  });
+
   socket.on('leaveRoom', function (_, ack) {
     const roomId = socket.data.roomId;
     const room = roomId ? rooms.get(roomId) : null;
