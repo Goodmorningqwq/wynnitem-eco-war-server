@@ -32,13 +32,21 @@ const UPGRADE_COSTS = {
   health: [0, 60, 140, 280, 500, 780, 1100, 1550, 2100, 2800, 3600, 4500], // wood
   defense: [0, 30, 80, 170, 320, 520, 780, 1100, 1500, 2000, 2600, 3300] // fish
 };
-const UPGRADE_CATEGORIES = ['damage', 'attackSpeed', 'health', 'defense'];
+const STORAGE_COSTS = {
+  emeralds: [0, 300, 650, 1100, 1700, 2500, 3500, 4700, 6200, 8000, 10100, 12500],
+  wood: [0, 100, 220, 400, 650, 950, 1350, 1850, 2500, 3300, 4300, 5500]
+};
+const UPGRADE_CATEGORIES = ['damage', 'attackSpeed', 'health', 'defense', 'storage'];
 const UPGRADE_RESOURCE_BY_CATEGORY = {
   damage: 'ore',
   attackSpeed: 'crops',
   health: 'wood',
-  defense: 'fish'
+  defense: 'fish',
+  storage: 'wood'
 };
+const RESOURCE_KEYS = ['emeralds', 'wood', 'ore', 'crops', 'fish'];
+const BASE_STORAGE_CAPACITY = 500000;
+const HQ_STORAGE_MULTIPLIER = 10;
 
 function buildAllowedOrigins() {
   const raw = typeof process.env.ALLOWED_ORIGINS === 'string' ? process.env.ALLOWED_ORIGINS : '';
@@ -217,6 +225,7 @@ function createRoomState(roomId, defenderSocketId) {
     selectedTerritories: [],
     defenderResources: createResources(),
     attackerResources: createResources(),
+    perTerritoryStorage: {},
     territoryUpgrades: {},
     prepSecondsRemaining: null,
     hqTerritory: '',
@@ -241,6 +250,7 @@ function publicRoomState(room) {
     selectedTerritories: room.selectedTerritories,
     defenderResources: room.defenderResources,
     attackerResources: room.attackerResources,
+    perTerritoryStorage: room.perTerritoryStorage,
     territoryUpgrades: room.territoryUpgrades,
     prepSecondsRemaining: room.prepSecondsRemaining,
     hqTerritory: room.hqTerritory,
@@ -382,30 +392,130 @@ function findRouteToHq(fromName, hqName, graph) {
   return null;
 }
 
+function ensurePerTerritoryStorage(room, territoryName) {
+  if (!room.perTerritoryStorage[territoryName]) {
+    room.perTerritoryStorage[territoryName] = createResources();
+  }
+  const row = room.perTerritoryStorage[territoryName];
+  for (let i = 0; i < RESOURCE_KEYS.length; i++) {
+    const key = RESOURCE_KEYS[i];
+    row[key] = Number(row[key] || 0);
+    if (!Number.isFinite(row[key]) || row[key] < 0) row[key] = 0;
+  }
+  return row;
+}
+
+function storageCapacityForType(storageLevel, isHq) {
+  const multiplier = 1 + (storageLevel * 0.25);
+  const hqMultiplier = isHq ? HQ_STORAGE_MULTIPLIER : 1;
+  return BASE_STORAGE_CAPACITY * multiplier * hqMultiplier;
+}
+
+function getStorageLevel(room, territoryName) {
+  const row = ensureTerritoryUpgradeShape(room, territoryName);
+  return clamp(parseInt(row.storage || 0, 10) || 0, 0, 11);
+}
+
+function applyVoidCaps(room, selected, messages) {
+  const hq = room.hqTerritory || '';
+  for (let i = 0; i < selected.length; i++) {
+    const territoryName = selected[i];
+    const store = ensurePerTerritoryStorage(room, territoryName);
+    const storageLevel = getStorageLevel(room, territoryName);
+    const isHq = territoryName === hq;
+    for (let r = 0; r < RESOURCE_KEYS.length; r++) {
+      const key = RESOURCE_KEYS[r];
+      const cap = storageCapacityForType(storageLevel, isHq);
+      if (store[key] > cap) {
+        const overflow = store[key] - cap;
+        store[key] = cap;
+        messages.push('Voided ' + Math.floor(overflow).toLocaleString() + ' ' + key + ' at ' + territoryName);
+      }
+    }
+  }
+}
+
+function buildNextHopCache(selected, hqTerritory) {
+  const nextHop = new Map();
+  const selectedSet = new Set(selected);
+  for (let i = 0; i < selected.length; i++) {
+    const fromName = selected[i];
+    if (fromName === hqTerritory) continue;
+    const path = findRouteToHq(fromName, hqTerritory, routeGraph);
+    if (!path || path.length < 2) continue;
+    const hop = path[1];
+    if (selectedSet.has(hop)) {
+      nextHop.set(fromName, hop);
+    }
+  }
+  return nextHop;
+}
+
+function moveOneHopPackets(room, selected, messages) {
+  const hq = room.hqTerritory || '';
+  if (!hq) return;
+  const nextHop = buildNextHopCache(selected, hq);
+  const arrivals = {};
+  for (let i = 0; i < selected.length; i++) {
+    const territoryName = selected[i];
+    if (territoryName === hq) continue;
+    const hop = nextHop.get(territoryName);
+    if (!hop) {
+      messages.push('No trade route path from ' + territoryName + ' to HQ ' + hq);
+      continue;
+    }
+    const sourceStore = ensurePerTerritoryStorage(room, territoryName);
+    let anyAmount = false;
+    for (let r = 0; r < RESOURCE_KEYS.length; r++) {
+      if (sourceStore[RESOURCE_KEYS[r]] > 0) {
+        anyAmount = true;
+        break;
+      }
+    }
+    if (!anyAmount) continue;
+    if (!arrivals[hop]) arrivals[hop] = createResources();
+    for (let r = 0; r < RESOURCE_KEYS.length; r++) {
+      const key = RESOURCE_KEYS[r];
+      arrivals[hop][key] += sourceStore[key];
+      sourceStore[key] = 0;
+    }
+  }
+  Object.keys(arrivals).forEach(function (destination) {
+    const store = ensurePerTerritoryStorage(room, destination);
+    const packet = arrivals[destination];
+    for (let r = 0; r < RESOURCE_KEYS.length; r++) {
+      const key = RESOURCE_KEYS[r];
+      store[key] += packet[key];
+    }
+  });
+}
+
 function applyUpgradeDrain(room, territoryNames, messages) {
   const tickHours = room.tickIntervalMs / 3600000;
   for (let i = 0; i < territoryNames.length; i++) {
     const territoryName = territoryNames[i];
     const upgrades = ensureTerritoryUpgradeShape(room, territoryName);
+    const storage = ensurePerTerritoryStorage(room, territoryName);
     const active = {};
     const inactive = {};
     for (let c = 0; c < UPGRADE_CATEGORIES.length; c++) {
       const category = UPGRADE_CATEGORIES[c];
+      if (category === 'storage') continue;
       const level = clamp(parseInt(upgrades[category] || 0, 10) || 0, 0, 11);
       if (!level) continue;
       const resourceKey = UPGRADE_RESOURCE_BY_CATEGORY[category];
       const hourlyCost = UPGRADE_COSTS[category][level] || 0;
       const perTickCost = hourlyCost * tickHours;
-      const current = Number(room.defenderResources[resourceKey] || 0);
+      const current = Number(storage[resourceKey] || 0);
       if (perTickCost <= 0) {
         active[category] = level;
         continue;
       }
       if (current >= perTickCost) {
-        room.defenderResources[resourceKey] = current - perTickCost;
+        storage[resourceKey] = current - perTickCost;
         active[category] = level;
       } else if (current > 0) {
-        room.defenderResources[resourceKey] = 0;
+        storage[resourceKey] = 0;
         inactive[category] = level;
       } else {
         inactive[category] = level;
@@ -430,21 +540,20 @@ function applyUpgradeDrain(room, territoryNames, messages) {
   }
 }
 
-function clampStorageAndDrain(room, messages) {
-  const resourceKeys = ['emeralds', 'wood', 'ore', 'crops', 'fish'];
-  for (let i = 0; i < resourceKeys.length; i++) {
-    const key = resourceKeys[i];
-    if (room.defenderResources[key] > room.maxStorage) {
-      const overflow = room.defenderResources[key] - room.maxStorage;
-      room.defenderResources[key] = room.maxStorage;
-      messages.push('VOID: ' + key + ' overflowed by ' + Math.floor(overflow));
-    }
-    if (room.defenderResources[key] < 0) {
-      messages.push('DRAIN: ' + key + ' went negative and was clamped to 0');
-      room.defenderResources[key] = 0;
-    }
-    room.defenderResources[key] = Math.floor(room.defenderResources[key]);
+function syncDefenderResourcesFromHq(room) {
+  const hq = room.hqTerritory || '';
+  if (!hq || !room.perTerritoryStorage[hq]) {
+    room.defenderResources = createResources();
+    return;
   }
+  const src = room.perTerritoryStorage[hq];
+  room.defenderResources = {
+    emeralds: Math.floor(src.emeralds || 0),
+    wood: Math.floor(src.wood || 0),
+    ore: Math.floor(src.ore || 0),
+    crops: Math.floor(src.crops || 0),
+    fish: Math.floor(src.fish || 0)
+  };
 }
 
 function runEcoTick(roomId) {
@@ -455,8 +564,10 @@ function runEcoTick(roomId) {
   const selected = Array.isArray(room.selectedTerritories) ? room.selectedTerritories : [];
   if (!selected.length) {
     messages.push('No selected territories to simulate.');
+    syncDefenderResourcesFromHq(room);
     io.to(roomId).emit('tick:update', {
       defenderResources: room.defenderResources,
+      perTerritoryStorage: room.perTerritoryStorage,
       messages,
       nextTickInMs: room.tickIntervalMs,
       serverNow: Date.now(),
@@ -469,6 +580,16 @@ function runEcoTick(roomId) {
     room.hqTerritory = selected[0];
   }
 
+  const selectedSet = new Set(selected);
+  Object.keys(room.perTerritoryStorage).forEach(function (territoryName) {
+    if (!selectedSet.has(territoryName)) {
+      delete room.perTerritoryStorage[territoryName];
+    }
+  });
+  for (let i = 0; i < selected.length; i++) {
+    ensurePerTerritoryStorage(room, selected[i]);
+  }
+
   for (let i = 0; i < selected.length; i++) {
     const territoryName = selected[i];
     const territory = territoryByName.get(territoryName);
@@ -476,34 +597,26 @@ function runEcoTick(roomId) {
       messages.push('Missing territory data: ' + territoryName);
       continue;
     }
-    const path = findRouteToHq(territoryName, room.hqTerritory, routeGraph);
-    if (!path) {
-      messages.push('No trade route path from ' + territoryName + ' to HQ ' + room.hqTerritory);
-      continue;
-    }
-    const routeNodesAfterStart = path.slice(1);
-    let multiplier = 1;
-    for (let p = 0; p < routeNodesAfterStart.length; p++) {
-      const hop = routeNodesAfterStart[p];
-      const hasOwnedTax = Object.prototype.hasOwnProperty.call(room.taxRates, hop);
-      const rawTax = hasOwnedTax ? room.taxRates[hop] : 0.2;
-      const taxRate = clamp(Number(rawTax) || 0, 0, 0.6);
-      multiplier *= (1 - taxRate);
-    }
-    room.defenderResources.emeralds += territory.resources.emeralds * multiplier;
-    room.defenderResources.wood += territory.resources.wood * multiplier;
-    room.defenderResources.ore += territory.resources.ore * multiplier;
-    room.defenderResources.crops += territory.resources.crops * multiplier;
-    room.defenderResources.fish += territory.resources.fish * multiplier;
+    const localStore = ensurePerTerritoryStorage(room, territoryName);
+    localStore.emeralds += territory.resources.emeralds;
+    localStore.wood += territory.resources.wood;
+    localStore.ore += territory.resources.ore;
+    localStore.crops += territory.resources.crops;
+    localStore.fish += territory.resources.fish;
   }
 
+  applyVoidCaps(room, selected, messages);
+  moveOneHopPackets(room, selected, messages);
+  applyVoidCaps(room, selected, messages);
   applyUpgradeDrain(room, selected, messages);
-  clampStorageAndDrain(room, messages);
+  applyVoidCaps(room, selected, messages);
+  syncDefenderResourcesFromHq(room);
   room.tickCount += 1;
   room.nextTickAt = Date.now() + room.tickIntervalMs;
 
   io.to(roomId).emit('tick:update', {
     defenderResources: room.defenderResources,
+    perTerritoryStorage: room.perTerritoryStorage,
     messages,
     nextTickInMs: room.tickIntervalMs,
     serverNow: Date.now(),
@@ -643,7 +756,8 @@ function ensureTerritoryUpgradeShape(room, territoryName) {
       damage: 0,
       attackSpeed: 0,
       health: 0,
-      defense: 0
+      defense: 0,
+      storage: 0
     };
   } else {
     const row = room.territoryUpgrades[territoryName];
@@ -651,6 +765,7 @@ function ensureTerritoryUpgradeShape(room, territoryName) {
     row.attackSpeed = normalizeUpgradeLevel(row.attackSpeed);
     row.health = normalizeUpgradeLevel(row.health);
     row.defense = normalizeUpgradeLevel(row.defense);
+    row.storage = normalizeUpgradeLevel(row.storage);
   }
   return room.territoryUpgrades[territoryName];
 }
@@ -666,7 +781,15 @@ function applyUpgrade(room, territoryName, category) {
     return { ok: false, error: category + ' is already at max level.' };
   }
   const nextLevel = currentLevel + 1;
-  const hourlyCost = UPGRADE_COSTS[category][nextLevel] || 0;
+  const hourlyCost = category === 'storage'
+    ? 0
+    : (UPGRADE_COSTS[category][nextLevel] || 0);
+  const storageCosts = category === 'storage'
+    ? {
+        emeralds: STORAGE_COSTS.emeralds[nextLevel] || 0,
+        wood: STORAGE_COSTS.wood[nextLevel] || 0
+      }
+    : null;
   upgrades[category] = nextLevel;
   return {
     ok: true,
@@ -674,7 +797,8 @@ function applyUpgrade(room, territoryName, category) {
     category,
     level: nextLevel,
     resourceKey,
-    hourlyCost
+    hourlyCost,
+    storageCosts
   };
 }
 
@@ -905,7 +1029,8 @@ io.on('connection', function (socket) {
       level: result.level,
       categoryCost: result.categoryCost,
       emeraldCost: result.emeraldCost,
-      resourceKey: result.resourceKey
+      resourceKey: result.resourceKey,
+      storageCosts: result.storageCosts
     });
     emitRoomState(roomId);
     if (typeof ack === 'function') ack({ ok: true, ...result });
