@@ -6,6 +6,18 @@ const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3001;
 const TICK_INTERVAL_MS = process.env.TICK_INTERVAL_MS
   ? parseInt(process.env.TICK_INTERVAL_MS, 10)
   : 6000;
+const RATE_LIMIT_WINDOW_MS = process.env.RATE_LIMIT_WINDOW_MS
+  ? parseInt(process.env.RATE_LIMIT_WINDOW_MS, 10)
+  : 10000;
+const RATE_LIMIT_MAX_SOCKET = process.env.RATE_LIMIT_MAX_SOCKET
+  ? parseInt(process.env.RATE_LIMIT_MAX_SOCKET, 10)
+  : 24;
+const RATE_LIMIT_MAX_IP = process.env.RATE_LIMIT_MAX_IP
+  ? parseInt(process.env.RATE_LIMIT_MAX_IP, 10)
+  : 60;
+const ECO_WAR_SHARED_TOKEN = typeof process.env.ECO_WAR_SHARED_TOKEN === 'string'
+  ? process.env.ECO_WAR_SHARED_TOKEN.trim()
+  : '';
 const PREP_SECONDS = 60;
 const TERRITORIES_URL =
   'https://raw.githubusercontent.com/jakematt123/Wynncraft-Territory-Info/main/territories.json';
@@ -17,10 +29,142 @@ const UPGRADE_COSTS = {
   defense: [0, 30, 80, 170, 320, 520, 780, 1100, 1500, 2000, 2600, 3300] // fish
 };
 
+function buildAllowedOrigins() {
+  const raw = typeof process.env.ALLOWED_ORIGINS === 'string' ? process.env.ALLOWED_ORIGINS : '';
+  const fromEnv = raw
+    .split(',')
+    .map(function (value) {
+      return value.trim();
+    })
+    .filter(function (value) {
+      return value.length > 0;
+    });
+  const defaults = [
+    'http://localhost:3000',
+    'http://localhost:5173',
+    'http://127.0.0.1:3000',
+    'http://127.0.0.1:5173'
+  ];
+  return Array.from(new Set(fromEnv.concat(defaults)));
+}
+
+const ALLOWED_ORIGINS = buildAllowedOrigins();
+
+function isOriginAllowed(origin) {
+  if (!origin) return true;
+  return ALLOWED_ORIGINS.indexOf(origin) !== -1;
+}
+
+const metrics = {
+  startedAt: Date.now(),
+  connectionsTotal: 0,
+  disconnectionsTotal: 0,
+  roomCreateTotal: 0,
+  roomJoinTotal: 0,
+  roomDeleteTotal: 0,
+  rateLimitRejectTotal: 0,
+  authRejectTotal: 0,
+  originRejectTotal: 0
+};
+
+/** @type {Map<string, { windowStart: number, counts: Record<string, number> }>} */
+const socketRateState = new Map();
+/** @type {Map<string, { windowStart: number, counts: Record<string, number> }>} */
+const ipRateState = new Map();
+
+function logEvent(event, detail) {
+  const payload = {
+    ts: new Date().toISOString(),
+    event,
+    detail: detail || {}
+  };
+  console.log(JSON.stringify(payload));
+}
+
+function getClientIp(socket) {
+  const fwd = socket && socket.handshake && socket.handshake.headers
+    ? socket.handshake.headers['x-forwarded-for']
+    : '';
+  if (typeof fwd === 'string' && fwd.trim()) {
+    return fwd.split(',')[0].trim();
+  }
+  return socket && socket.handshake && socket.handshake.address
+    ? String(socket.handshake.address)
+    : 'unknown';
+}
+
+function tokenFromHandshake(socket) {
+  const authToken = socket && socket.handshake && socket.handshake.auth
+    ? socket.handshake.auth.token
+    : '';
+  if (typeof authToken === 'string' && authToken.trim()) {
+    return authToken.trim();
+  }
+  const headerToken = socket && socket.handshake && socket.handshake.headers
+    ? socket.handshake.headers['x-eco-war-token']
+    : '';
+  if (typeof headerToken === 'string' && headerToken.trim()) {
+    return headerToken.trim();
+  }
+  return '';
+}
+
+function isPrivilegedAuthorized(socket) {
+  if (!ECO_WAR_SHARED_TOKEN) return true;
+  return tokenFromHandshake(socket) === ECO_WAR_SHARED_TOKEN;
+}
+
+function requirePrivilegedAccess(socket, ack, eventName) {
+  if (isPrivilegedAuthorized(socket)) return true;
+  metrics.authRejectTotal += 1;
+  logEvent('auth_reject', {
+    event: eventName,
+    socketId: socket.id,
+    ip: socket.data && socket.data.clientIp ? socket.data.clientIp : 'unknown'
+  });
+  if (typeof ack === 'function') {
+    ack({ ok: false, error: 'Unauthorized action.' });
+  }
+  return false;
+}
+
+function consumeBucket(map, key, eventName, limit) {
+  const now = Date.now();
+  const current = map.get(key) || { windowStart: now, counts: {} };
+  if (now - current.windowStart >= RATE_LIMIT_WINDOW_MS) {
+    current.windowStart = now;
+    current.counts = {};
+  }
+  const nextCount = (current.counts[eventName] || 0) + 1;
+  current.counts[eventName] = nextCount;
+  map.set(key, current);
+  return nextCount <= limit;
+}
+
+function allowEventRate(socket, eventName) {
+  const socketOk = consumeBucket(socketRateState, socket.id, eventName, RATE_LIMIT_MAX_SOCKET);
+  const ip = socket.data && socket.data.clientIp ? socket.data.clientIp : 'unknown';
+  const ipOk = consumeBucket(ipRateState, ip, eventName, RATE_LIMIT_MAX_IP);
+  if (socketOk && ipOk) return true;
+  metrics.rateLimitRejectTotal += 1;
+  logEvent('rate_limit_reject', { event: eventName, socketId: socket.id, ip });
+  return false;
+}
+
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: '*' }
+  cors: {
+    origin: function (origin, callback) {
+      if (isOriginAllowed(origin)) {
+        callback(null, true);
+        return;
+      }
+      metrics.originRejectTotal += 1;
+      logEvent('origin_reject', { origin: origin || '' });
+      callback(new Error('Origin not allowed'));
+    }
+  }
 });
 
 /** @type {Map<string, any>} */
@@ -354,6 +498,8 @@ function cleanupRoomIfEmpty(roomId) {
     stopPrepTicker(room);
     stopTickLoop(room);
     rooms.delete(roomId);
+    metrics.roomDeleteTotal += 1;
+    logEvent('room_deleted', { roomId });
   }
 }
 
@@ -431,7 +577,19 @@ function applyUpgrade(room, territoryName, category) {
 }
 
 io.on('connection', function (socket) {
+  metrics.connectionsTotal += 1;
+  socket.data.clientIp = getClientIp(socket);
+  logEvent('socket_connected', {
+    socketId: socket.id,
+    ip: socket.data.clientIp
+  });
+
   socket.on('createRoom', function (_, ack) {
+    if (!requirePrivilegedAccess(socket, ack, 'createRoom')) return;
+    if (!allowEventRate(socket, 'createRoom')) {
+      if (typeof ack === 'function') ack({ ok: false, error: 'Too many requests. Try again shortly.' });
+      return;
+    }
     const roomId = generateRoomId();
     if (!roomId) {
       if (typeof ack === 'function') ack({ ok: false, error: 'Failed to allocate room code.' });
@@ -442,11 +600,17 @@ io.on('connection', function (socket) {
     socket.join(roomId);
     socket.data.roomId = roomId;
     socket.data.role = 'defender';
+    metrics.roomCreateTotal += 1;
+    logEvent('room_created', { roomId, socketId: socket.id, ip: socket.data.clientIp });
     emitRoomState(roomId);
     if (typeof ack === 'function') ack({ ok: true, roomId, role: 'defender' });
   });
 
   socket.on('joinRoom', function (payload, ack) {
+    if (!allowEventRate(socket, 'joinRoom')) {
+      if (typeof ack === 'function') ack({ ok: false, error: 'Too many requests. Try again shortly.' });
+      return;
+    }
     const roomId = payload && typeof payload.roomId === 'string' ? payload.roomId.trim() : '';
     if (!/^\d{6}$/.test(roomId)) {
       if (typeof ack === 'function') ack({ ok: false, error: 'Room code must be 6 digits.' });
@@ -466,11 +630,17 @@ io.on('connection', function (socket) {
     socket.join(roomId);
     socket.data.roomId = roomId;
     socket.data.role = 'attacker';
+    metrics.roomJoinTotal += 1;
+    logEvent('room_joined', { roomId, socketId: socket.id, ip: socket.data.clientIp });
     emitRoomState(roomId);
     if (typeof ack === 'function') ack({ ok: true, roomId, role: 'attacker' });
   });
 
   socket.on('updateSelection', function (payload, ack) {
+    if (!allowEventRate(socket, 'updateSelection')) {
+      if (typeof ack === 'function') ack({ ok: false, error: 'Too many requests. Try again shortly.' });
+      return;
+    }
     const roomId = socket.data.roomId;
     const room = roomId ? rooms.get(roomId) : null;
     if (!room) {
@@ -503,6 +673,11 @@ io.on('connection', function (socket) {
   });
 
   socket.on('setReady', async function (payload, ack) {
+    if (!requirePrivilegedAccess(socket, ack, 'setReady')) return;
+    if (!allowEventRate(socket, 'setReady')) {
+      if (typeof ack === 'function') ack({ ok: false, error: 'Too many requests. Try again shortly.' });
+      return;
+    }
     const roomId = socket.data.roomId;
     const room = roomId ? rooms.get(roomId) : null;
     if (!room) {
@@ -540,6 +715,11 @@ io.on('connection', function (socket) {
   });
 
   socket.on('upgrade:apply', function (payload, ack) {
+    if (!requirePrivilegedAccess(socket, ack, 'upgrade:apply')) return;
+    if (!allowEventRate(socket, 'upgrade:apply')) {
+      if (typeof ack === 'function') ack({ ok: false, error: 'Too many requests. Try again shortly.' });
+      return;
+    }
     const roomId = socket.data.roomId;
     const room = roomId ? rooms.get(roomId) : null;
     if (!room) {
@@ -602,8 +782,15 @@ io.on('connection', function (socket) {
   });
 
   socket.on('disconnect', function () {
+    metrics.disconnectionsTotal += 1;
     const roomId = socket.data.roomId;
     const room = roomId ? rooms.get(roomId) : null;
+    socketRateState.delete(socket.id);
+    logEvent('socket_disconnected', {
+      socketId: socket.id,
+      ip: socket.data && socket.data.clientIp ? socket.data.clientIp : 'unknown',
+      roomId: roomId || ''
+    });
     if (!room) return;
     const role = roleForSocket(room, socket.id);
     if (role === 'defender') room.defenderSocketId = null;
@@ -620,7 +807,25 @@ app.get('/health', function (_req, res) {
     rooms: rooms.size,
     territoryCacheSize: territoryByName.size,
     territoryCacheLoadedAt,
-    territoryCacheLoadError
+    territoryCacheLoadError,
+    uptimeMs: Date.now() - metrics.startedAt,
+    tokenAuthEnabled: !!ECO_WAR_SHARED_TOKEN,
+    allowedOrigins: ALLOWED_ORIGINS,
+    rateLimit: {
+      windowMs: RATE_LIMIT_WINDOW_MS,
+      maxPerSocket: RATE_LIMIT_MAX_SOCKET,
+      maxPerIp: RATE_LIMIT_MAX_IP
+    },
+    metrics: {
+      connectionsTotal: metrics.connectionsTotal,
+      disconnectionsTotal: metrics.disconnectionsTotal,
+      roomCreateTotal: metrics.roomCreateTotal,
+      roomJoinTotal: metrics.roomJoinTotal,
+      roomDeleteTotal: metrics.roomDeleteTotal,
+      rateLimitRejectTotal: metrics.rateLimitRejectTotal,
+      authRejectTotal: metrics.authRejectTotal,
+      originRejectTotal: metrics.originRejectTotal
+    }
   });
 });
 
