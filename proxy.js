@@ -28,6 +28,13 @@ const UPGRADE_COSTS = {
   health: [0, 60, 140, 280, 500, 780, 1100, 1550, 2100, 2800, 3600, 4500], // wood
   defense: [0, 30, 80, 170, 320, 520, 780, 1100, 1500, 2000, 2600, 3300] // fish
 };
+const UPGRADE_CATEGORIES = ['damage', 'attackSpeed', 'health', 'defense'];
+const UPGRADE_RESOURCE_BY_CATEGORY = {
+  damage: 'ore',
+  attackSpeed: 'crops',
+  health: 'wood',
+  defense: 'fish'
+};
 
 function buildAllowedOrigins() {
   const raw = typeof process.env.ALLOWED_ORIGINS === 'string' ? process.env.ALLOWED_ORIGINS : '';
@@ -353,24 +360,49 @@ function findRouteToHq(fromName, hqName, graph) {
 }
 
 function applyUpgradeDrain(room, territoryNames, messages) {
+  const tickHours = room.tickIntervalMs / 3600000;
   for (let i = 0; i < territoryNames.length; i++) {
     const territoryName = territoryNames[i];
-    const upgrades = room.territoryUpgrades[territoryName] || {};
-    const damageLevel = clamp(parseInt(upgrades.damage || 0, 10) || 0, 0, 11);
-    const speedLevel = clamp(parseInt(upgrades.attackSpeed || 0, 10) || 0, 0, 11);
-    const healthLevel = clamp(parseInt(upgrades.health || 0, 10) || 0, 0, 11);
-    const defenseLevel = clamp(parseInt(upgrades.defense || 0, 10) || 0, 0, 11);
-
-    room.defenderResources.ore -= UPGRADE_COSTS.damage[damageLevel];
-    room.defenderResources.crops -= UPGRADE_COSTS.attackSpeed[speedLevel];
-    room.defenderResources.wood -= UPGRADE_COSTS.health[healthLevel];
-    room.defenderResources.fish -= UPGRADE_COSTS.defense[defenseLevel];
-
-    if (damageLevel || speedLevel || healthLevel || defenseLevel) {
-      messages.push(
-        'Drain on ' + territoryName + ': d' + damageLevel +
-          ' as' + speedLevel + ' h' + healthLevel + ' def' + defenseLevel
-      );
+    const upgrades = ensureTerritoryUpgradeShape(room, territoryName);
+    const active = {};
+    const inactive = {};
+    for (let c = 0; c < UPGRADE_CATEGORIES.length; c++) {
+      const category = UPGRADE_CATEGORIES[c];
+      const level = clamp(parseInt(upgrades[category] || 0, 10) || 0, 0, 11);
+      if (!level) continue;
+      const resourceKey = UPGRADE_RESOURCE_BY_CATEGORY[category];
+      const hourlyCost = UPGRADE_COSTS[category][level] || 0;
+      const perTickCost = hourlyCost * tickHours;
+      const current = Number(room.defenderResources[resourceKey] || 0);
+      if (perTickCost <= 0) {
+        active[category] = level;
+        continue;
+      }
+      if (current >= perTickCost) {
+        room.defenderResources[resourceKey] = current - perTickCost;
+        active[category] = level;
+      } else if (current > 0) {
+        room.defenderResources[resourceKey] = 0;
+        inactive[category] = level;
+      } else {
+        inactive[category] = level;
+      }
+    }
+    const activeParts = [];
+    const inactiveParts = [];
+    if (active.damage) activeParts.push('D' + active.damage);
+    if (active.attackSpeed) activeParts.push('AS' + active.attackSpeed);
+    if (active.health) activeParts.push('H' + active.health);
+    if (active.defense) activeParts.push('DEF' + active.defense);
+    if (inactive.damage) inactiveParts.push('D' + inactive.damage);
+    if (inactive.attackSpeed) inactiveParts.push('AS' + inactive.attackSpeed);
+    if (inactive.health) inactiveParts.push('H' + inactive.health);
+    if (inactive.defense) inactiveParts.push('DEF' + inactive.defense);
+    if (activeParts.length || inactiveParts.length) {
+      let line = territoryName + ' upgrades';
+      if (activeParts.length) line += ' active(' + activeParts.join(',') + ')';
+      if (inactiveParts.length) line += ' inactive(' + inactiveParts.join(',') + ')';
+      messages.push(line);
     }
   }
 }
@@ -540,13 +572,7 @@ function ensureTerritoryUpgradeShape(room, territoryName) {
 }
 
 function applyUpgrade(room, territoryName, category) {
-  const resourceByCategory = {
-    damage: 'ore',
-    attackSpeed: 'crops',
-    health: 'wood',
-    defense: 'fish'
-  };
-  const resourceKey = resourceByCategory[category];
+  const resourceKey = UPGRADE_RESOURCE_BY_CATEGORY[category];
   if (!resourceKey) {
     return { ok: false, error: 'Invalid upgrade category.' };
   }
@@ -556,25 +582,15 @@ function applyUpgrade(room, territoryName, category) {
     return { ok: false, error: category + ' is already at max level.' };
   }
   const nextLevel = currentLevel + 1;
-  const categoryCost = UPGRADE_COSTS[category][nextLevel] || 0;
-  const emeraldCost = categoryCost;
-  if (room.defenderResources.emeralds < emeraldCost) {
-    return { ok: false, error: 'Not enough emeralds.' };
-  }
-  if (room.defenderResources[resourceKey] < categoryCost) {
-    return { ok: false, error: 'Not enough ' + resourceKey + '.' };
-  }
-  room.defenderResources.emeralds -= emeraldCost;
-  room.defenderResources[resourceKey] -= categoryCost;
+  const hourlyCost = UPGRADE_COSTS[category][nextLevel] || 0;
   upgrades[category] = nextLevel;
   return {
     ok: true,
     territoryName,
     category,
     level: nextLevel,
-    categoryCost,
-    emeraldCost,
-    resourceKey
+    resourceKey,
+    hourlyCost
   };
 }
 
@@ -728,8 +744,8 @@ io.on('connection', function (socket) {
       if (typeof ack === 'function') ack({ ok: false, error: 'Not in a room.' });
       return;
     }
-    if (room.status !== 'playing') {
-      if (typeof ack === 'function') ack({ ok: false, error: 'Upgrades are only available during playing state.' });
+    if (room.status !== 'playing' && room.status !== 'prep') {
+      if (typeof ack === 'function') ack({ ok: false, error: 'Upgrades are only available during prep/playing.' });
       return;
     }
     const role = roleForSocket(room, socket.id);
