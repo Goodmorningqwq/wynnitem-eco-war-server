@@ -6,7 +6,7 @@ const { Server } = require('socket.io');
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3001;
 const TICK_INTERVAL_MS = process.env.TICK_INTERVAL_MS
   ? parseInt(process.env.TICK_INTERVAL_MS, 10)
-  : 6000;
+  : 60000;
 const RATE_LIMIT_WINDOW_MS = process.env.RATE_LIMIT_WINDOW_MS
   ? parseInt(process.env.RATE_LIMIT_WINDOW_MS, 10)
   : 10000;
@@ -47,6 +47,20 @@ const UPGRADE_RESOURCE_BY_CATEGORY = {
 const RESOURCE_KEYS = ['emeralds', 'wood', 'ore', 'crops', 'fish'];
 const BASE_STORAGE_CAPACITY = 500000;
 const HQ_STORAGE_MULTIPLIER = 10;
+
+/**
+ * Lesson: trade-route levy — fraction of goods lost each hop (not deposited at the next node).
+ * Example: 0.05 means 5% voided when moving one territory toward HQ.
+ */
+const TRADE_ROUTE_TAX_PER_HOP = (function () {
+  const raw = process.env.TRADE_ROUTE_TAX_PER_HOP
+    ? parseFloat(process.env.TRADE_ROUTE_TAX_PER_HOP)
+    : 0.05;
+  return Math.max(0, Math.min(0.95, Number.isFinite(raw) ? raw : 0.05));
+})();
+
+const PRODUCTION_MULT_MIN = 0.5;
+const PRODUCTION_MULT_MAX = 1.5;
 
 function buildAllowedOrigins() {
   const raw = typeof process.env.ALLOWED_ORIGINS === 'string' ? process.env.ALLOWED_ORIGINS : '';
@@ -230,6 +244,8 @@ function createRoomState(roomId, defenderSocketId) {
     prepSecondsRemaining: null,
     hqTerritory: '',
     taxRates: {},
+    routeMode: 'fastest',
+    productionMultiplier: 1,
     maxStorage: 1000000,
     tickIntervalMs: TICK_INTERVAL_MS,
     tickTimer: null,
@@ -254,6 +270,8 @@ function publicRoomState(room) {
     territoryUpgrades: room.territoryUpgrades,
     prepSecondsRemaining: room.prepSecondsRemaining,
     hqTerritory: room.hqTerritory,
+    routeMode: room.routeMode || 'fastest',
+    productionMultiplier: room.productionMultiplier != null ? room.productionMultiplier : 1,
     maxStorage: room.maxStorage,
     tickIntervalMs: room.tickIntervalMs,
     nextTickAt: room.nextTickAt,
@@ -271,6 +289,15 @@ function hasRolePresence(room, role) {
   return false;
 }
 
+/**
+ * @param {object} row
+ * @returns {string[]}
+ */
+function readTradeRoutes(row) {
+  const tr = row['Trading Routes'] || row.tradingRoutes || row.trade_routes;
+  return Array.isArray(tr) ? tr.map(String) : [];
+}
+
 async function loadTerritoryCache() {
   const res = await fetch(TERRITORIES_URL, { headers: { Accept: 'application/json' } });
   if (!res.ok) {
@@ -282,11 +309,7 @@ async function loadTerritoryCache() {
   Object.keys(data || {}).forEach(function (name) {
     const row = data[name] || {};
     const resources = row.resources || {};
-    const tradeRoutes = Array.isArray(row.trade_routes)
-      ? row.trade_routes.map(String)
-      : Array.isArray(row['Trading Routes'])
-        ? row['Trading Routes'].map(String)
-        : [];
+    const tradeRoutes = readTradeRoutes(row);
     byName.set(name, {
       name,
       resources: {
@@ -392,6 +415,63 @@ function findRouteToHq(fromName, hqName, graph) {
   return null;
 }
 
+/**
+ * Selected-only shortest path by weighted edge cost (lesson: "cheapest" route).
+ * Edge cost uses 1 + TRADE_ROUTE_TAX_PER_HOP so it stays aligned with tax narrative;
+ * when costs are uniform per hop, results match fewest-hop paths (same as fastest).
+ */
+function findSelectedOnlyPathToHqDijkstra(fromName, hqName, selectedAdjacency) {
+  if (!fromName || !hqName) return null;
+  if (fromName === hqName) return [hqName];
+  if (!selectedAdjacency.has(fromName) || !selectedAdjacency.has(hqName)) return null;
+  const dist = new Map();
+  const parent = new Map();
+  const visited = new Set();
+  const nodes = [];
+  selectedAdjacency.forEach(function (_, k) {
+    nodes.push(k);
+    dist.set(k, Infinity);
+  });
+  dist.set(fromName, 0);
+  const edgeW = 1 + TRADE_ROUTE_TAX_PER_HOP;
+  while (visited.size < nodes.length) {
+    let u = null;
+    let best = Infinity;
+    for (let i = 0; i < nodes.length; i++) {
+      const n = nodes[i];
+      if (visited.has(n)) continue;
+      const d = dist.get(n);
+      if (d < best) {
+        best = d;
+        u = n;
+      }
+    }
+    if (u === null || best === Infinity) break;
+    if (u === hqName) break;
+    visited.add(u);
+    const neighbors = Array.from(selectedAdjacency.get(u) || []);
+    for (let i = 0; i < neighbors.length; i++) {
+      const v = neighbors[i];
+      if (visited.has(v)) continue;
+      const alt = dist.get(u) + edgeW;
+      if (alt < dist.get(v)) {
+        dist.set(v, alt);
+        parent.set(v, u);
+      }
+    }
+  }
+  if (dist.get(hqName) === Infinity) return null;
+  const path = [hqName];
+  let cursor = hqName;
+  while (cursor !== fromName) {
+    if (!parent.has(cursor)) return null;
+    cursor = parent.get(cursor);
+    path.push(cursor);
+  }
+  path.reverse();
+  return path;
+}
+
 function buildSelectedAdjacency(selected, graph) {
   const selectedSet = new Set(selected);
   const adjacency = new Map();
@@ -485,12 +565,17 @@ function applyVoidCaps(room, selected, messages) {
   }
 }
 
-function buildNextHopCache(selected, hqTerritory, selectedAdjacency) {
+function buildNextHopCache(room, selected, hqTerritory, selectedAdjacency) {
+  const mode = room && room.routeMode === 'cheapest' ? 'cheapest' : 'fastest';
+  const findPath =
+    mode === 'cheapest'
+      ? findSelectedOnlyPathToHqDijkstra
+      : findSelectedOnlyPathToHq;
   const nextHop = new Map();
   for (let i = 0; i < selected.length; i++) {
     const fromName = selected[i];
     if (fromName === hqTerritory) continue;
-    const path = findSelectedOnlyPathToHq(fromName, hqTerritory, selectedAdjacency);
+    const path = findPath(fromName, hqTerritory, selectedAdjacency);
     if (!path || path.length < 2) continue;
     const hop = path[1];
     nextHop.set(fromName, hop);
@@ -502,7 +587,8 @@ function moveOneHopPackets(room, selected, messages) {
   const hq = room.hqTerritory || '';
   if (!hq) return;
   const selectedAdjacency = buildSelectedAdjacency(selected, routeGraph);
-  const nextHop = buildNextHopCache(selected, hq, selectedAdjacency);
+  const nextHop = buildNextHopCache(room, selected, hq, selectedAdjacency);
+  const keepFrac = Math.max(0, Math.min(1, 1 - TRADE_ROUTE_TAX_PER_HOP));
   const arrivals = {};
   for (let i = 0; i < selected.length; i++) {
     const territoryName = selected[i];
@@ -524,8 +610,10 @@ function moveOneHopPackets(room, selected, messages) {
     if (!arrivals[hop]) arrivals[hop] = createResources();
     for (let r = 0; r < RESOURCE_KEYS.length; r++) {
       const key = RESOURCE_KEYS[r];
-      arrivals[hop][key] += sourceStore[key];
+      const amt = Number(sourceStore[key]) || 0;
+      const moved = Math.floor(amt * keepFrac);
       sourceStore[key] = 0;
+      arrivals[hop][key] += moved;
     }
   }
   Object.keys(arrivals).forEach(function (destination) {
@@ -646,11 +734,16 @@ function runEcoTick(roomId) {
       continue;
     }
     const localStore = ensurePerTerritoryStorage(room, territoryName);
-    localStore.emeralds += territory.resources.emeralds;
-    localStore.wood += territory.resources.wood;
-    localStore.ore += territory.resources.ore;
-    localStore.crops += territory.resources.crops;
-    localStore.fish += territory.resources.fish;
+    const mult = clamp(
+      Number(room.productionMultiplier) || 1,
+      PRODUCTION_MULT_MIN,
+      PRODUCTION_MULT_MAX
+    );
+    localStore.emeralds += Math.floor(territory.resources.emeralds * mult);
+    localStore.wood += Math.floor(territory.resources.wood * mult);
+    localStore.ore += Math.floor(territory.resources.ore * mult);
+    localStore.crops += Math.floor(territory.resources.crops * mult);
+    localStore.fish += Math.floor(territory.resources.fish * mult);
   }
 
   applyVoidCaps(room, selected, messages);
@@ -1115,6 +1208,58 @@ io.on('connection', function (socket) {
     room.hqTerritory = territoryName;
     emitRoomState(roomId);
     if (typeof ack === 'function') ack({ ok: true, hqTerritory: room.hqTerritory });
+  });
+
+  socket.on('eco:setRouteMode', function (payload, ack) {
+    if (!requirePrivilegedAccess(socket, ack, 'eco:setRouteMode')) return;
+    if (!allowEventRate(socket, 'eco:setRouteMode')) {
+      if (typeof ack === 'function') ack({ ok: false, error: 'Too many requests. Try again shortly.' });
+      return;
+    }
+    const roomId = socket.data.roomId;
+    const room = roomId ? rooms.get(roomId) : null;
+    if (!room) {
+      if (typeof ack === 'function') ack({ ok: false, error: 'Not in a room.' });
+      return;
+    }
+    const role = roleForSocket(room, socket.id);
+    if (role !== 'defender') {
+      if (typeof ack === 'function') ack({ ok: false, error: 'Only defender can set route mode.' });
+      return;
+    }
+    const mode = payload && payload.routeMode === 'cheapest' ? 'cheapest' : 'fastest';
+    room.routeMode = mode;
+    emitRoomState(roomId);
+    if (typeof ack === 'function') ack({ ok: true, routeMode: room.routeMode });
+  });
+
+  socket.on('eco:setProductionMultiplier', function (payload, ack) {
+    if (!requirePrivilegedAccess(socket, ack, 'eco:setProductionMultiplier')) return;
+    if (!allowEventRate(socket, 'eco:setProductionMultiplier')) {
+      if (typeof ack === 'function') ack({ ok: false, error: 'Too many requests. Try again shortly.' });
+      return;
+    }
+    const roomId = socket.data.roomId;
+    const room = roomId ? rooms.get(roomId) : null;
+    if (!room) {
+      if (typeof ack === 'function') ack({ ok: false, error: 'Not in a room.' });
+      return;
+    }
+    const role = roleForSocket(room, socket.id);
+    if (role !== 'defender') {
+      if (typeof ack === 'function') ack({ ok: false, error: 'Only defender can set production buff.' });
+      return;
+    }
+    const raw = payload && payload.multiplier != null ? Number(payload.multiplier) : NaN;
+    if (!Number.isFinite(raw)) {
+      if (typeof ack === 'function') ack({ ok: false, error: 'Invalid multiplier.' });
+      return;
+    }
+    room.productionMultiplier = clamp(raw, PRODUCTION_MULT_MIN, PRODUCTION_MULT_MAX);
+    emitRoomState(roomId);
+    if (typeof ack === 'function') {
+      ack({ ok: true, productionMultiplier: room.productionMultiplier });
+    }
   });
 
   socket.on('leaveRoom', function (_, ack) {
