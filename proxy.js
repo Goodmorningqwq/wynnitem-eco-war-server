@@ -40,6 +40,8 @@ function buildAllowedOrigins() {
       return value.length > 0;
     });
   const defaults = [
+    'https://wynnitem-territory.vercel.app',
+    'https://wynnitem-territories.vercel.app',
     'http://localhost:3000',
     'http://localhost:5173',
     'http://127.0.0.1:3000',
