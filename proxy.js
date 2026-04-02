@@ -392,6 +392,56 @@ function findRouteToHq(fromName, hqName, graph) {
   return null;
 }
 
+function buildSelectedAdjacency(selected, graph) {
+  const selectedSet = new Set(selected);
+  const adjacency = new Map();
+  selected.forEach(function (name) {
+    adjacency.set(name, new Set());
+  });
+  selected.forEach(function (fromName) {
+    const outgoing = graph.get(fromName) || [];
+    for (let i = 0; i < outgoing.length; i++) {
+      const toName = outgoing[i];
+      if (!selectedSet.has(toName)) continue;
+      adjacency.get(fromName).add(toName);
+      adjacency.get(toName).add(fromName);
+    }
+  });
+  return adjacency;
+}
+
+function findSelectedOnlyPathToHq(fromName, hqName, selectedAdjacency) {
+  if (!fromName || !hqName) return null;
+  if (fromName === hqName) return [hqName];
+  if (!selectedAdjacency.has(fromName) || !selectedAdjacency.has(hqName)) return null;
+  const queue = [fromName];
+  const visited = new Set([fromName]);
+  const parent = new Map();
+  while (queue.length > 0) {
+    const current = queue.shift();
+    const neighbors = Array.from(selectedAdjacency.get(current) || []);
+    for (let i = 0; i < neighbors.length; i++) {
+      const next = neighbors[i];
+      if (visited.has(next)) continue;
+      visited.add(next);
+      parent.set(next, current);
+      if (next === hqName) {
+        const path = [hqName];
+        let cursor = hqName;
+        while (parent.has(cursor)) {
+          cursor = parent.get(cursor);
+          path.push(cursor);
+          if (cursor === fromName) break;
+        }
+        path.reverse();
+        return path;
+      }
+      queue.push(next);
+    }
+  }
+  return null;
+}
+
 function ensurePerTerritoryStorage(room, territoryName) {
   if (!room.perTerritoryStorage[territoryName]) {
     room.perTerritoryStorage[territoryName] = createResources();
@@ -435,18 +485,15 @@ function applyVoidCaps(room, selected, messages) {
   }
 }
 
-function buildNextHopCache(selected, hqTerritory) {
+function buildNextHopCache(selected, hqTerritory, selectedAdjacency) {
   const nextHop = new Map();
-  const selectedSet = new Set(selected);
   for (let i = 0; i < selected.length; i++) {
     const fromName = selected[i];
     if (fromName === hqTerritory) continue;
-    const path = findRouteToHq(fromName, hqTerritory, routeGraph);
+    const path = findSelectedOnlyPathToHq(fromName, hqTerritory, selectedAdjacency);
     if (!path || path.length < 2) continue;
     const hop = path[1];
-    if (selectedSet.has(hop)) {
-      nextHop.set(fromName, hop);
-    }
+    nextHop.set(fromName, hop);
   }
   return nextHop;
 }
@@ -454,7 +501,8 @@ function buildNextHopCache(selected, hqTerritory) {
 function moveOneHopPackets(room, selected, messages) {
   const hq = room.hqTerritory || '';
   if (!hq) return;
-  const nextHop = buildNextHopCache(selected, hq);
+  const selectedAdjacency = buildSelectedAdjacency(selected, routeGraph);
+  const nextHop = buildNextHopCache(selected, hq, selectedAdjacency);
   const arrivals = {};
   for (let i = 0; i < selected.length; i++) {
     const territoryName = selected[i];
