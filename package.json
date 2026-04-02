@@ -1,0 +1,14 @@
+{
+  "name": "eco-war-room-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "main": "proxy.js",
+  "scripts": {
+    "start": "node proxy.js"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "socket.io": "^4.8.3"
+  }
+}
