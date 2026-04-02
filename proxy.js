@@ -1,5 +1,6 @@
 const express = require('express');
 const http = require('http');
+const crypto = require('crypto');
 const { Server } = require('socket.io');
 
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3001;
@@ -15,6 +16,9 @@ const RATE_LIMIT_MAX_SOCKET = process.env.RATE_LIMIT_MAX_SOCKET
 const RATE_LIMIT_MAX_IP = process.env.RATE_LIMIT_MAX_IP
   ? parseInt(process.env.RATE_LIMIT_MAX_IP, 10)
   : 60;
+const DISCONNECT_GRACE_MS = process.env.DISCONNECT_GRACE_MS
+  ? parseInt(process.env.DISCONNECT_GRACE_MS, 10)
+  : 60000;
 const ECO_WAR_SHARED_TOKEN = typeof process.env.ECO_WAR_SHARED_TOKEN === 'string'
   ? process.env.ECO_WAR_SHARED_TOKEN.trim()
   : '';
@@ -71,6 +75,9 @@ const metrics = {
   roomCreateTotal: 0,
   roomJoinTotal: 0,
   roomDeleteTotal: 0,
+  resumeSuccessTotal: 0,
+  resumeFailTotal: 0,
+  graceExpiryTotal: 0,
   rateLimitRejectTotal: 0,
   authRejectTotal: 0,
   originRejectTotal: 0
@@ -198,7 +205,13 @@ function createRoomState(roomId, defenderSocketId) {
     id: roomId,
     status: 'lobby',
     defenderSocketId,
+    defenderSessionToken: crypto.randomBytes(16).toString('hex'),
+    defenderPendingDisconnectAt: null,
+    defenderDisconnectTimer: null,
     attackerSocketId: null,
+    attackerSessionToken: '',
+    attackerPendingDisconnectAt: null,
+    attackerDisconnectTimer: null,
     defenderReady: false,
     attackerReady: false,
     selectedTerritories: [],
@@ -236,6 +249,16 @@ function publicRoomState(room) {
     nextTickAt: room.nextTickAt,
     tickCount: room.tickCount
   };
+}
+
+function hasRolePresence(room, role) {
+  if (role === 'defender') {
+    return !!room.defenderSocketId || !!room.defenderPendingDisconnectAt;
+  }
+  if (role === 'attacker') {
+    return !!room.attackerSocketId || !!room.attackerPendingDisconnectAt;
+  }
+  return false;
 }
 
 async function loadTerritoryCache() {
@@ -528,13 +551,74 @@ function startPrepCountdown(roomId) {
 function cleanupRoomIfEmpty(roomId) {
   const room = rooms.get(roomId);
   if (!room) return;
-  if (!room.defenderSocketId && !room.attackerSocketId) {
+  if (!hasRolePresence(room, 'defender') && !hasRolePresence(room, 'attacker')) {
     stopPrepTicker(room);
     stopTickLoop(room);
+    if (room.defenderDisconnectTimer) {
+      clearTimeout(room.defenderDisconnectTimer);
+      room.defenderDisconnectTimer = null;
+    }
+    if (room.attackerDisconnectTimer) {
+      clearTimeout(room.attackerDisconnectTimer);
+      room.attackerDisconnectTimer = null;
+    }
     rooms.delete(roomId);
     metrics.roomDeleteTotal += 1;
     logEvent('room_deleted', { roomId });
   }
+}
+
+function roleTokenField(role) {
+  return role === 'defender' ? 'defenderSessionToken' : 'attackerSessionToken';
+}
+
+function roleSocketField(role) {
+  return role === 'defender' ? 'defenderSocketId' : 'attackerSocketId';
+}
+
+function rolePendingField(role) {
+  return role === 'defender' ? 'defenderPendingDisconnectAt' : 'attackerPendingDisconnectAt';
+}
+
+function roleTimerField(role) {
+  return role === 'defender' ? 'defenderDisconnectTimer' : 'attackerDisconnectTimer';
+}
+
+function clearDisconnectGrace(room, role) {
+  const timerField = roleTimerField(role);
+  const pendingField = rolePendingField(role);
+  if (room[timerField]) {
+    clearTimeout(room[timerField]);
+    room[timerField] = null;
+  }
+  room[pendingField] = null;
+}
+
+function scheduleDisconnectGrace(roomId, role) {
+  const room = rooms.get(roomId);
+  if (!room) return;
+  const pendingField = rolePendingField(role);
+  const timerField = roleTimerField(role);
+  clearDisconnectGrace(room, role);
+  room[pendingField] = Date.now();
+  room[timerField] = setTimeout(function () {
+    const activeRoom = rooms.get(roomId);
+    if (!activeRoom) return;
+    const activeSocketField = roleSocketField(role);
+    const activePendingField = rolePendingField(role);
+    const activeTimerField = roleTimerField(role);
+    if (activeRoom[activeSocketField]) return;
+    activeRoom[activePendingField] = null;
+    activeRoom[activeTimerField] = null;
+    if (role === 'attacker') {
+      activeRoom.attackerSessionToken = '';
+    }
+    metrics.graceExpiryTotal += 1;
+    logEvent('grace_expired', { roomId, role });
+    resetRoomOnPlayerLeave(activeRoom);
+    emitRoomState(roomId);
+    cleanupRoomIfEmpty(roomId);
+  }, DISCONNECT_GRACE_MS);
 }
 
 function resetRoomOnPlayerLeave(room) {
@@ -621,7 +705,9 @@ io.on('connection', function (socket) {
     metrics.roomCreateTotal += 1;
     logEvent('room_created', { roomId, socketId: socket.id, ip: socket.data.clientIp });
     emitRoomState(roomId);
-    if (typeof ack === 'function') ack({ ok: true, roomId, role: 'defender' });
+    if (typeof ack === 'function') {
+      ack({ ok: true, roomId, role: 'defender', playerToken: room.defenderSessionToken });
+    }
   });
 
   socket.on('joinRoom', function (payload, ack) {
@@ -644,6 +730,8 @@ io.on('connection', function (socket) {
       return;
     }
     room.attackerSocketId = socket.id;
+    room.attackerSessionToken = crypto.randomBytes(16).toString('hex');
+    clearDisconnectGrace(room, 'attacker');
     room.attackerReady = false;
     socket.join(roomId);
     socket.data.roomId = roomId;
@@ -651,7 +739,50 @@ io.on('connection', function (socket) {
     metrics.roomJoinTotal += 1;
     logEvent('room_joined', { roomId, socketId: socket.id, ip: socket.data.clientIp });
     emitRoomState(roomId);
-    if (typeof ack === 'function') ack({ ok: true, roomId, role: 'attacker' });
+    if (typeof ack === 'function') {
+      ack({ ok: true, roomId, role: 'attacker', playerToken: room.attackerSessionToken });
+    }
+  });
+
+  socket.on('resumeRoom', function (payload, ack) {
+    if (!requirePrivilegedAccess(socket, ack, 'resumeRoom')) return;
+    if (!allowEventRate(socket, 'resumeRoom')) {
+      if (typeof ack === 'function') ack({ ok: false, error: 'Too many requests. Try again shortly.' });
+      return;
+    }
+    const roomId = payload && typeof payload.roomId === 'string' ? payload.roomId.trim() : '';
+    const playerToken = payload && typeof payload.playerToken === 'string' ? payload.playerToken.trim() : '';
+    if (!/^\d{6}$/.test(roomId) || !playerToken) {
+      metrics.resumeFailTotal += 1;
+      if (typeof ack === 'function') ack({ ok: false, error: 'Invalid resume payload.' });
+      return;
+    }
+    const room = rooms.get(roomId);
+    if (!room) {
+      metrics.resumeFailTotal += 1;
+      if (typeof ack === 'function') ack({ ok: false, error: 'Room not found.' });
+      return;
+    }
+    let role = null;
+    if (room.defenderSessionToken && room.defenderSessionToken === playerToken) {
+      role = 'defender';
+    } else if (room.attackerSessionToken && room.attackerSessionToken === playerToken) {
+      role = 'attacker';
+    }
+    if (!role) {
+      metrics.resumeFailTotal += 1;
+      if (typeof ack === 'function') ack({ ok: false, error: 'Resume token invalid.' });
+      return;
+    }
+    room[roleSocketField(role)] = socket.id;
+    clearDisconnectGrace(room, role);
+    socket.join(roomId);
+    socket.data.roomId = roomId;
+    socket.data.role = role;
+    metrics.resumeSuccessTotal += 1;
+    logEvent('room_resumed', { roomId, role, socketId: socket.id, ip: socket.data.clientIp });
+    emitRoomState(roomId);
+    if (typeof ack === 'function') ack({ ok: true, roomId, role });
   });
 
   socket.on('updateSelection', function (payload, ack) {
@@ -788,8 +919,15 @@ io.on('connection', function (socket) {
       return;
     }
     const role = roleForSocket(room, socket.id);
-    if (role === 'defender') room.defenderSocketId = null;
-    if (role === 'attacker') room.attackerSocketId = null;
+    if (role === 'defender') {
+      room.defenderSocketId = null;
+      clearDisconnectGrace(room, 'defender');
+    }
+    if (role === 'attacker') {
+      room.attackerSocketId = null;
+      room.attackerSessionToken = '';
+      clearDisconnectGrace(room, 'attacker');
+    }
     resetRoomOnPlayerLeave(room);
     socket.leave(roomId);
     socket.data.roomId = null;
@@ -811,11 +949,10 @@ io.on('connection', function (socket) {
     });
     if (!room) return;
     const role = roleForSocket(room, socket.id);
-    if (role === 'defender') room.defenderSocketId = null;
-    if (role === 'attacker') room.attackerSocketId = null;
-    resetRoomOnPlayerLeave(room);
+    if (!role) return;
+    room[roleSocketField(role)] = null;
+    scheduleDisconnectGrace(roomId, role);
     emitRoomState(roomId);
-    cleanupRoomIfEmpty(roomId);
   });
 });
 
@@ -834,12 +971,18 @@ app.get('/health', function (_req, res) {
       maxPerSocket: RATE_LIMIT_MAX_SOCKET,
       maxPerIp: RATE_LIMIT_MAX_IP
     },
+    roomLifecycle: {
+      disconnectGraceMs: DISCONNECT_GRACE_MS
+    },
     metrics: {
       connectionsTotal: metrics.connectionsTotal,
       disconnectionsTotal: metrics.disconnectionsTotal,
       roomCreateTotal: metrics.roomCreateTotal,
       roomJoinTotal: metrics.roomJoinTotal,
       roomDeleteTotal: metrics.roomDeleteTotal,
+      resumeSuccessTotal: metrics.resumeSuccessTotal,
+      resumeFailTotal: metrics.resumeFailTotal,
+      graceExpiryTotal: metrics.graceExpiryTotal,
       rateLimitRejectTotal: metrics.rateLimitRejectTotal,
       authRejectTotal: metrics.authRejectTotal,
       originRejectTotal: metrics.originRejectTotal
