@@ -1,203 +1,168 @@
+'use strict';
+
 const express = require('express');
 const http = require('http');
 const crypto = require('crypto');
 const { Server } = require('socket.io');
 
+// ─── Server Config ────────────────────────────────────────────────────────────
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3001;
-const TICK_INTERVAL_MS = process.env.TICK_INTERVAL_MS
-  ? parseInt(process.env.TICK_INTERVAL_MS, 10)
-  : 60000;
-const RATE_LIMIT_WINDOW_MS = process.env.RATE_LIMIT_WINDOW_MS
-  ? parseInt(process.env.RATE_LIMIT_WINDOW_MS, 10)
-  : 10000;
-const RATE_LIMIT_MAX_SOCKET = process.env.RATE_LIMIT_MAX_SOCKET
-  ? parseInt(process.env.RATE_LIMIT_MAX_SOCKET, 10)
-  : 24;
-const RATE_LIMIT_MAX_IP = process.env.RATE_LIMIT_MAX_IP
-  ? parseInt(process.env.RATE_LIMIT_MAX_IP, 10)
-  : 60;
-const DISCONNECT_GRACE_MS = process.env.DISCONNECT_GRACE_MS
-  ? parseInt(process.env.DISCONNECT_GRACE_MS, 10)
-  : 60000;
-const ECO_WAR_SHARED_TOKEN = typeof process.env.ECO_WAR_SHARED_TOKEN === 'string'
-  ? process.env.ECO_WAR_SHARED_TOKEN.trim()
-  : '';
+const TICK_INTERVAL_MS = process.env.TICK_INTERVAL_MS ? parseInt(process.env.TICK_INTERVAL_MS, 10) : 60000;
+const RATE_LIMIT_WINDOW_MS = process.env.RATE_LIMIT_WINDOW_MS ? parseInt(process.env.RATE_LIMIT_WINDOW_MS, 10) : 10000;
+const RATE_LIMIT_MAX_SOCKET = process.env.RATE_LIMIT_MAX_SOCKET ? parseInt(process.env.RATE_LIMIT_MAX_SOCKET, 10) : 24;
+const RATE_LIMIT_MAX_IP = process.env.RATE_LIMIT_MAX_IP ? parseInt(process.env.RATE_LIMIT_MAX_IP, 10) : 60;
+const DISCONNECT_GRACE_MS = process.env.DISCONNECT_GRACE_MS ? parseInt(process.env.DISCONNECT_GRACE_MS, 10) : 60000;
+const ECO_WAR_SHARED_TOKEN = typeof process.env.ECO_WAR_SHARED_TOKEN === 'string' ? process.env.ECO_WAR_SHARED_TOKEN.trim() : '';
 const PREP_SECONDS = 60;
-const TERRITORIES_URL =
-  'https://raw.githubusercontent.com/jakematt123/Wynncraft-Territory-Info/main/territories.json';
+const TERRITORIES_URL = 'https://raw.githubusercontent.com/jakematt123/Wynncraft-Territory-Info/main/territories.json';
+
+// ─── Game Constants (Real Wynncraft Values) ───────────────────────────────────
+/**
+ * All 4 tower stat upgrades (Damage/AttackSpeed/Health/Defense) share the
+ * SAME hourly drain cost table in Wynncraft. Index = level.
+ */
+const UPGRADE_COSTS_PER_LEVEL = [0, 100, 300, 600, 1200, 2400, 4800, 8400, 12000, 15600, 19200, 22800];
 
 const UPGRADE_COSTS = {
-  damage: [0, 50, 120, 250, 450, 700, 1000, 1400, 1900, 2500, 3200, 4000], // ore
-  attackSpeed: [0, 40, 100, 220, 400, 650, 950, 1350, 1800, 2400, 3100, 3900], // crops
-  health: [0, 60, 140, 280, 500, 780, 1100, 1550, 2100, 2800, 3600, 4500], // wood
-  defense: [0, 30, 80, 170, 320, 520, 780, 1100, 1500, 2000, 2600, 3300] // fish
+  damage: UPGRADE_COSTS_PER_LEVEL,
+  attackSpeed: UPGRADE_COSTS_PER_LEVEL,
+  health: UPGRADE_COSTS_PER_LEVEL,
+  defense: UPGRADE_COSTS_PER_LEVEL
 };
-const STORAGE_COSTS = {
-  emeralds: [0, 300, 650, 1100, 1700, 2500, 3500, 4700, 6200, 8000, 10100, 12500],
-  wood: [0, 100, 220, 400, 650, 950, 1350, 1850, 2500, 3300, 4300, 5500]
+
+// Storage upgrade one-time cost: [emeralds, wood] per level (index = next level)
+const STORAGE_UPGRADE_COSTS = [
+  [0, 0], [300, 100], [650, 220], [1100, 400], [1700, 650],
+  [2500, 950], [3500, 1350], [4700, 1850], [6200, 2500],
+  [8000, 3300], [10100, 4300], [12500, 5500]
+];
+
+// Bonus system: hourly drain per level, resource key
+const BONUS_DEFS = {
+  strongerMobs:       { resource: 'wood',     costs: [0, 1200, 2400, 4800], maxLevel: 3 },
+  multiAttack:        { resource: 'fish',     costs: [0, 3200],             maxLevel: 1 },
+  aura:               { resource: 'crops',    costs: [0, 2000],             maxLevel: 1 },
+  volley:             { resource: 'ore',      costs: [0, 2000],             maxLevel: 1 },
+  resourceProduction: { resource: 'ore',      costs: [0, 800, 1600, 3200],  maxLevel: 3 },
+  emeraldProduction:  { resource: 'emeralds', costs: [0, 1000, 2000, 4000], maxLevel: 3 }
 };
+
 const UPGRADE_CATEGORIES = ['damage', 'attackSpeed', 'health', 'defense', 'storage'];
 const UPGRADE_RESOURCE_BY_CATEGORY = {
-  damage: 'ore',
-  attackSpeed: 'crops',
-  health: 'wood',
-  defense: 'fish',
-  storage: 'wood'
+  damage: 'ore', attackSpeed: 'crops', health: 'wood', defense: 'fish', storage: 'wood'
 };
 const RESOURCE_KEYS = ['emeralds', 'wood', 'ore', 'crops', 'fish'];
-const BASE_STORAGE_CAPACITY = 500000;
-const HQ_STORAGE_MULTIPLIER = 10;
 
-/**
- * Lesson: trade-route levy — fraction of goods lost each hop (not deposited at the next node).
- * Example: 0.05 means 5% voided when moving one territory toward HQ.
- */
-const TRADE_ROUTE_TAX_PER_HOP = (function () {
-  const raw = process.env.TRADE_ROUTE_TAX_PER_HOP
-    ? parseFloat(process.env.TRADE_ROUTE_TAX_PER_HOP)
-    : 0.05;
-  return Math.max(0, Math.min(0.95, Number.isFinite(raw) ? raw : 0.05));
-})();
+// HQ storage: real Wynncraft values (1,500 → 120,000 resources; 5,000 → 400,000 emeralds)
+const HQ_BASE_STORAGE_RESOURCE = 1500;
+const HQ_BASE_STORAGE_EMERALDS = 5000;
+const HQ_MAX_STORAGE_RESOURCE  = 120000;
+const HQ_MAX_STORAGE_EMERALDS  = 400000;
 
+// Treasury: +5% per full hour held, capped at +100%
+const TREASURY_BONUS_PER_HOUR = 0.05;
+const TREASURY_BONUS_MAX      = 1.0;
+
+// Production bonus per level of resourceProduction / emeraldProduction bonus
+const RESOURCE_PROD_BONUS_PER_LEVEL = 0.10;
+const EMERALD_PROD_BONUS_PER_LEVEL  = 0.10;
+
+// Combat
+const TOWER_BASE_HP      = 1000000; // base HP at level 0, no connections
+const WAR_GRACE_SECONDS  = 30;
+const WAR_ATTACK_TYPES   = {
+  solo:   { label: 'Solo Warrer',      dps: 150000   },
+  normal: { label: 'Normal War Team',  dps: 2000000  },
+  elite:  { label: 'Elite War Team',   dps: 4000000  }
+};
 const PRODUCTION_MULT_MIN = 0.5;
 const PRODUCTION_MULT_MAX = 1.5;
 
+// ─── Origin / Auth ────────────────────────────────────────────────────────────
 function buildAllowedOrigins() {
   const raw = typeof process.env.ALLOWED_ORIGINS === 'string' ? process.env.ALLOWED_ORIGINS : '';
-  const fromEnv = raw
-    .split(',')
-    .map(function (value) {
-      return value.trim();
-    })
-    .filter(function (value) {
-      return value.length > 0;
-    });
+  const fromEnv = raw.split(',').map(v => v.trim()).filter(v => v.length > 0);
   const defaults = [
     'https://wynnitem-territory.vercel.app',
     'https://wynnitem-territories.vercel.app',
-    'http://localhost:3000',
-    'http://localhost:5173',
-    'http://127.0.0.1:3000',
-    'http://127.0.0.1:5173'
+    'http://localhost:3000', 'http://localhost:5173',
+    'http://127.0.0.1:3000', 'http://127.0.0.1:5173'
   ];
   return Array.from(new Set(fromEnv.concat(defaults)));
 }
-
 const ALLOWED_ORIGINS = buildAllowedOrigins();
-
 function isOriginAllowed(origin) {
   if (!origin) return true;
   return ALLOWED_ORIGINS.indexOf(origin) !== -1;
 }
 
+// ─── Metrics ──────────────────────────────────────────────────────────────────
 const metrics = {
   startedAt: Date.now(),
-  connectionsTotal: 0,
-  disconnectionsTotal: 0,
-  roomCreateTotal: 0,
-  roomJoinTotal: 0,
-  roomDeleteTotal: 0,
-  resumeSuccessTotal: 0,
-  resumeFailTotal: 0,
-  graceExpiryTotal: 0,
-  rateLimitRejectTotal: 0,
-  authRejectTotal: 0,
-  originRejectTotal: 0
+  connectionsTotal: 0, disconnectionsTotal: 0,
+  roomCreateTotal: 0, roomJoinTotal: 0, roomDeleteTotal: 0,
+  resumeSuccessTotal: 0, resumeFailTotal: 0,
+  graceExpiryTotal: 0, rateLimitRejectTotal: 0,
+  authRejectTotal: 0, originRejectTotal: 0
 };
 
-/** @type {Map<string, { windowStart: number, counts: Record<string, number> }>} */
+// ─── Rate Limiting ────────────────────────────────────────────────────────────
 const socketRateState = new Map();
-/** @type {Map<string, { windowStart: number, counts: Record<string, number> }>} */
 const ipRateState = new Map();
 
 function logEvent(event, detail) {
-  const payload = {
-    ts: new Date().toISOString(),
-    event,
-    detail: detail || {}
-  };
-  console.log(JSON.stringify(payload));
+  console.log(JSON.stringify({ ts: new Date().toISOString(), event, detail: detail || {} }));
 }
-
 function getClientIp(socket) {
   const fwd = socket && socket.handshake && socket.handshake.headers
-    ? socket.handshake.headers['x-forwarded-for']
-    : '';
-  if (typeof fwd === 'string' && fwd.trim()) {
-    return fwd.split(',')[0].trim();
-  }
-  return socket && socket.handshake && socket.handshake.address
-    ? String(socket.handshake.address)
-    : 'unknown';
+    ? socket.handshake.headers['x-forwarded-for'] : '';
+  if (typeof fwd === 'string' && fwd.trim()) return fwd.split(',')[0].trim();
+  return socket && socket.handshake && socket.handshake.address ? String(socket.handshake.address) : 'unknown';
 }
-
 function tokenFromHandshake(socket) {
-  const authToken = socket && socket.handshake && socket.handshake.auth
-    ? socket.handshake.auth.token
-    : '';
-  if (typeof authToken === 'string' && authToken.trim()) {
-    return authToken.trim();
-  }
+  const authToken = socket && socket.handshake && socket.handshake.auth ? socket.handshake.auth.token : '';
+  if (typeof authToken === 'string' && authToken.trim()) return authToken.trim();
   const headerToken = socket && socket.handshake && socket.handshake.headers
-    ? socket.handshake.headers['x-eco-war-token']
-    : '';
-  if (typeof headerToken === 'string' && headerToken.trim()) {
-    return headerToken.trim();
-  }
+    ? socket.handshake.headers['x-eco-war-token'] : '';
+  if (typeof headerToken === 'string' && headerToken.trim()) return headerToken.trim();
   return '';
 }
-
 function isPrivilegedAuthorized(socket) {
   if (!ECO_WAR_SHARED_TOKEN) return true;
   return tokenFromHandshake(socket) === ECO_WAR_SHARED_TOKEN;
 }
-
 function requirePrivilegedAccess(socket, ack, eventName) {
   if (isPrivilegedAuthorized(socket)) return true;
   metrics.authRejectTotal += 1;
-  logEvent('auth_reject', {
-    event: eventName,
-    socketId: socket.id,
-    ip: socket.data && socket.data.clientIp ? socket.data.clientIp : 'unknown'
-  });
-  if (typeof ack === 'function') {
-    ack({ ok: false, error: 'Unauthorized action.' });
-  }
+  logEvent('auth_reject', { event: eventName, socketId: socket.id });
+  if (typeof ack === 'function') ack({ ok: false, error: 'Unauthorized.' });
   return false;
 }
-
 function consumeBucket(map, key, eventName, limit) {
   const now = Date.now();
   const current = map.get(key) || { windowStart: now, counts: {} };
-  if (now - current.windowStart >= RATE_LIMIT_WINDOW_MS) {
-    current.windowStart = now;
-    current.counts = {};
-  }
+  if (now - current.windowStart >= RATE_LIMIT_WINDOW_MS) { current.windowStart = now; current.counts = {}; }
   const nextCount = (current.counts[eventName] || 0) + 1;
   current.counts[eventName] = nextCount;
   map.set(key, current);
   return nextCount <= limit;
 }
-
 function allowEventRate(socket, eventName) {
   const socketOk = consumeBucket(socketRateState, socket.id, eventName, RATE_LIMIT_MAX_SOCKET);
   const ip = socket.data && socket.data.clientIp ? socket.data.clientIp : 'unknown';
   const ipOk = consumeBucket(ipRateState, ip, eventName, RATE_LIMIT_MAX_IP);
   if (socketOk && ipOk) return true;
   metrics.rateLimitRejectTotal += 1;
-  logEvent('rate_limit_reject', { event: eventName, socketId: socket.id, ip });
   return false;
 }
 
+// ─── Express / Socket.io ──────────────────────────────────────────────────────
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
     origin: function (origin, callback) {
-      if (isOriginAllowed(origin)) {
-        callback(null, true);
-        return;
-      }
+      if (isOriginAllowed(origin)) { callback(null, true); return; }
       metrics.originRejectTotal += 1;
       logEvent('origin_reject', { origin: origin || '' });
       callback(new Error('Origin not allowed'));
@@ -205,23 +170,21 @@ const io = new Server(server, {
   }
 });
 
-/** @type {Map<string, any>} */
+// ─── Data Stores ──────────────────────────────────────────────────────────────
 const rooms = new Map();
-/** @type {Map<string, any>} */
 let territoryByName = new Map();
-/** @type {Map<string, string[]>} */
 let routeGraph = new Map();
 let territoryCacheLoadedAt = 0;
 let territoryCacheLoadError = '';
 
-function createResources() {
-  return { emeralds: 0, wood: 0, ore: 0, crops: 0, fish: 0 };
+// ─── Helper: create empty resources ───────────────────────────────────────────
+function createResources() { return { emeralds: 0, wood: 0, ore: 0, crops: 0, fish: 0 }; }
+function clamp(value, min, max) { return Math.max(min, Math.min(max, value)); }
+function createTerritoryBonuses() {
+  return { strongerMobs: 0, multiAttack: 0, aura: 0, volley: 0, resourceProduction: 0, emeraldProduction: 0 };
 }
 
-function clamp(value, min, max) {
-  return Math.max(min, Math.min(max, value));
-}
-
+// ─── Room State ───────────────────────────────────────────────────────────────
 function createRoomState(roomId, defenderSocketId) {
   return {
     id: roomId,
@@ -241,17 +204,25 @@ function createRoomState(roomId, defenderSocketId) {
     attackerResources: createResources(),
     perTerritoryStorage: {},
     territoryUpgrades: {},
+    territoryBonuses: {},
+    territoryTaxRates: {},      // { territoryName: { enemy: 0.30, ally: 0.10 } }
+    territoryRouteMode: {},     // { territoryName: 'fastest'|'cheapest' }
+    territoryHeldSince: {},     // { territoryName: timestamp_ms }
     prepSecondsRemaining: null,
     hqTerritory: '',
-    taxRates: {},
     routeMode: 'fastest',
     productionMultiplier: 1,
-    maxStorage: 1000000,
     tickIntervalMs: TICK_INTERVAL_MS,
     tickTimer: null,
     prepTimer: null,
     nextTickAt: null,
-    tickCount: 0
+    tickCount: 0,
+    attackerWarType: null,
+    warTimeSeconds: null,
+    warStartedAt: null,
+    warTimer: null,
+    warResult: null,
+    warTowerStats: null
   };
 }
 
@@ -268,31 +239,26 @@ function publicRoomState(room) {
     attackerResources: room.attackerResources,
     perTerritoryStorage: room.perTerritoryStorage,
     territoryUpgrades: room.territoryUpgrades,
+    territoryBonuses: room.territoryBonuses,
+    territoryTaxRates: room.territoryTaxRates,
+    territoryRouteMode: room.territoryRouteMode,
+    territoryHeldSince: room.territoryHeldSince,
     prepSecondsRemaining: room.prepSecondsRemaining,
     hqTerritory: room.hqTerritory,
     routeMode: room.routeMode || 'fastest',
     productionMultiplier: room.productionMultiplier != null ? room.productionMultiplier : 1,
-    maxStorage: room.maxStorage,
     tickIntervalMs: room.tickIntervalMs,
     nextTickAt: room.nextTickAt,
-    tickCount: room.tickCount
+    tickCount: room.tickCount,
+    attackerWarType: room.attackerWarType,
+    warTimeSeconds: room.warTimeSeconds,
+    warStartedAt: room.warStartedAt,
+    warResult: room.warResult,
+    warTowerStats: room.warTowerStats
   };
 }
 
-function hasRolePresence(room, role) {
-  if (role === 'defender') {
-    return !!room.defenderSocketId || !!room.defenderPendingDisconnectAt;
-  }
-  if (role === 'attacker') {
-    return !!room.attackerSocketId || !!room.attackerPendingDisconnectAt;
-  }
-  return false;
-}
-
-/**
- * @param {object} row
- * @returns {string[]}
- */
+// ─── Territory Cache ──────────────────────────────────────────────────────────
 function readTradeRoutes(row) {
   const tr = row['Trading Routes'] || row.tradingRoutes || row.trade_routes;
   return Array.isArray(tr) ? tr.map(String) : [];
@@ -300,9 +266,7 @@ function readTradeRoutes(row) {
 
 async function loadTerritoryCache() {
   const res = await fetch(TERRITORIES_URL, { headers: { Accept: 'application/json' } });
-  if (!res.ok) {
-    throw new Error('territories.json fetch failed: ' + res.status);
-  }
+  if (!res.ok) throw new Error('territories.json fetch failed: ' + res.status);
   const data = await res.json();
   const byName = new Map();
   const graph = new Map();
@@ -331,24 +295,20 @@ async function loadTerritoryCache() {
 
 async function ensureTerritoryCacheLoaded() {
   if (territoryByName.size > 0) return;
-  try {
-    await loadTerritoryCache();
-  } catch (e) {
-    territoryCacheLoadError = e instanceof Error ? e.message : 'Unknown territory cache error';
+  try { await loadTerritoryCache(); }
+  catch (e) {
+    territoryCacheLoadError = e instanceof Error ? e.message : String(e);
     throw new Error(territoryCacheLoadError);
   }
 }
 
+// ─── Room State Helpers ───────────────────────────────────────────────────────
 function emitRoomState(roomId) {
   const room = rooms.get(roomId);
   if (!room) return;
   io.to(roomId).emit('roomState', publicRoomState(room));
 }
-
-function emitRoomError(roomId, message) {
-  io.to(roomId).emit('roomError', { error: message });
-}
-
+function emitRoomError(roomId, message) { io.to(roomId).emit('roomError', { error: message }); }
 function generateRoomId() {
   let tries = 0;
   while (tries < 20) {
@@ -358,128 +318,19 @@ function generateRoomId() {
   }
   return null;
 }
-
 function roleForSocket(room, socketId) {
   if (room.defenderSocketId === socketId) return 'defender';
   if (room.attackerSocketId === socketId) return 'attacker';
   return null;
 }
 
-function stopPrepTicker(room) {
-  if (room.prepTimer) {
-    clearInterval(room.prepTimer);
-    room.prepTimer = null;
-  }
-}
-
-function stopTickLoop(room) {
-  if (room.tickTimer) {
-    clearInterval(room.tickTimer);
-    room.tickTimer = null;
-  }
-  room.nextTickAt = null;
-}
-
-/**
- * BFS shortest-path search from a territory to the current HQ.
- * Returns a path array including both endpoints, or null if no route exists.
- */
-function findRouteToHq(fromName, hqName, graph) {
-  if (!fromName || !hqName) return null;
-  if (fromName === hqName) return [hqName];
-  const queue = [fromName];
-  const visited = new Set([fromName]);
-  const parent = new Map();
-  while (queue.length > 0) {
-    const current = queue.shift();
-    const neighbors = graph.get(current) || [];
-    for (let i = 0; i < neighbors.length; i++) {
-      const next = neighbors[i];
-      if (visited.has(next)) continue;
-      visited.add(next);
-      parent.set(next, current);
-      if (next === hqName) {
-        const path = [hqName];
-        let cursor = hqName;
-        while (parent.has(cursor)) {
-          cursor = parent.get(cursor);
-          path.push(cursor);
-          if (cursor === fromName) break;
-        }
-        path.reverse();
-        return path;
-      }
-      queue.push(next);
-    }
-  }
-  return null;
-}
-
-/**
- * Selected-only shortest path by weighted edge cost (lesson: "cheapest" route).
- * Edge cost uses 1 + TRADE_ROUTE_TAX_PER_HOP so it stays aligned with tax narrative;
- * when costs are uniform per hop, results match fewest-hop paths (same as fastest).
- */
-function findSelectedOnlyPathToHqDijkstra(fromName, hqName, selectedAdjacency) {
-  if (!fromName || !hqName) return null;
-  if (fromName === hqName) return [hqName];
-  if (!selectedAdjacency.has(fromName) || !selectedAdjacency.has(hqName)) return null;
-  const dist = new Map();
-  const parent = new Map();
-  const visited = new Set();
-  const nodes = [];
-  selectedAdjacency.forEach(function (_, k) {
-    nodes.push(k);
-    dist.set(k, Infinity);
-  });
-  dist.set(fromName, 0);
-  const edgeW = 1 + TRADE_ROUTE_TAX_PER_HOP;
-  while (visited.size < nodes.length) {
-    let u = null;
-    let best = Infinity;
-    for (let i = 0; i < nodes.length; i++) {
-      const n = nodes[i];
-      if (visited.has(n)) continue;
-      const d = dist.get(n);
-      if (d < best) {
-        best = d;
-        u = n;
-      }
-    }
-    if (u === null || best === Infinity) break;
-    if (u === hqName) break;
-    visited.add(u);
-    const neighbors = Array.from(selectedAdjacency.get(u) || []);
-    for (let i = 0; i < neighbors.length; i++) {
-      const v = neighbors[i];
-      if (visited.has(v)) continue;
-      const alt = dist.get(u) + edgeW;
-      if (alt < dist.get(v)) {
-        dist.set(v, alt);
-        parent.set(v, u);
-      }
-    }
-  }
-  if (dist.get(hqName) === Infinity) return null;
-  const path = [hqName];
-  let cursor = hqName;
-  while (cursor !== fromName) {
-    if (!parent.has(cursor)) return null;
-    cursor = parent.get(cursor);
-    path.push(cursor);
-  }
-  path.reverse();
-  return path;
-}
-
-function buildSelectedAdjacency(selected, graph) {
+// ─── Route Finding ────────────────────────────────────────────────────────────
+function buildSelectedAdjacency(selected) {
   const selectedSet = new Set(selected);
   const adjacency = new Map();
-  selected.forEach(function (name) {
-    adjacency.set(name, new Set());
-  });
+  selected.forEach(function (name) { adjacency.set(name, new Set()); });
   selected.forEach(function (fromName) {
-    const outgoing = graph.get(fromName) || [];
+    const outgoing = routeGraph.get(fromName) || [];
     for (let i = 0; i < outgoing.length; i++) {
       const toName = outgoing[i];
       if (!selectedSet.has(toName)) continue;
@@ -508,13 +359,8 @@ function findSelectedOnlyPathToHq(fromName, hqName, selectedAdjacency) {
       if (next === hqName) {
         const path = [hqName];
         let cursor = hqName;
-        while (parent.has(cursor)) {
-          cursor = parent.get(cursor);
-          path.push(cursor);
-          if (cursor === fromName) break;
-        }
-        path.reverse();
-        return path;
+        while (parent.has(cursor)) { cursor = parent.get(cursor); path.push(cursor); if (cursor === fromName) break; }
+        return path.reverse();
       }
       queue.push(next);
     }
@@ -522,6 +368,13 @@ function findSelectedOnlyPathToHq(fromName, hqName, selectedAdjacency) {
   return null;
 }
 
+function findSelectedOnlyPathToHqCheapest(fromName, hqName, selectedAdjacency) {
+  // Dijkstra with uniform edge weight (same as BFS in topology sense,
+  // but lets individual territories choose a distinct algorithm path for future tax logic)
+  return findSelectedOnlyPathToHq(fromName, hqName, selectedAdjacency);
+}
+
+// ─── Storage Helpers ──────────────────────────────────────────────────────────
 function ensurePerTerritoryStorage(room, territoryName) {
   if (!room.perTerritoryStorage[territoryName]) {
     room.perTerritoryStorage[territoryName] = createResources();
@@ -535,371 +388,58 @@ function ensurePerTerritoryStorage(room, territoryName) {
   return row;
 }
 
-function storageCapacityForType(storageLevel, isHq) {
-  const multiplier = 1 + (storageLevel * 0.25);
-  const hqMultiplier = isHq ? HQ_STORAGE_MULTIPLIER : 1;
-  return BASE_STORAGE_CAPACITY * multiplier * hqMultiplier;
+/**
+ * HQ storage capacity at a given storage level.
+ * Non-HQ territories have unlimited pass-through storage (Infinity).
+ */
+function hqStorageCapacity(storageLevel, resourceKey) {
+  const level = clamp(storageLevel, 0, 11);
+  if (resourceKey === 'emeralds') {
+    return Math.floor(HQ_BASE_STORAGE_EMERALDS + (level / 11) * (HQ_MAX_STORAGE_EMERALDS - HQ_BASE_STORAGE_EMERALDS));
+  }
+  return Math.floor(HQ_BASE_STORAGE_RESOURCE + (level / 11) * (HQ_MAX_STORAGE_RESOURCE - HQ_BASE_STORAGE_RESOURCE));
 }
 
 function getStorageLevel(room, territoryName) {
-  const row = ensureTerritoryUpgradeShape(room, territoryName);
-  return clamp(parseInt(row.storage || 0, 10) || 0, 0, 11);
+  const row = room.territoryUpgrades && room.territoryUpgrades[territoryName];
+  return clamp(parseInt((row && row.storage) || 0, 10) || 0, 0, 11);
 }
 
-function applyVoidCaps(room, selected, messages) {
-  const hq = room.hqTerritory || '';
-  for (let i = 0; i < selected.length; i++) {
-    const territoryName = selected[i];
-    const store = ensurePerTerritoryStorage(room, territoryName);
-    const storageLevel = getStorageLevel(room, territoryName);
-    const isHq = territoryName === hq;
-    for (let r = 0; r < RESOURCE_KEYS.length; r++) {
-      const key = RESOURCE_KEYS[r];
-      const cap = storageCapacityForType(storageLevel, isHq);
-      if (store[key] > cap) {
-        const overflow = store[key] - cap;
-        store[key] = cap;
-        messages.push('Voided ' + Math.floor(overflow).toLocaleString() + ' ' + key + ' at ' + territoryName);
-      }
-    }
-  }
-}
-
-function buildNextHopCache(room, selected, hqTerritory, selectedAdjacency) {
-  const mode = room && room.routeMode === 'cheapest' ? 'cheapest' : 'fastest';
-  const findPath =
-    mode === 'cheapest'
-      ? findSelectedOnlyPathToHqDijkstra
-      : findSelectedOnlyPathToHq;
-  const nextHop = new Map();
-  for (let i = 0; i < selected.length; i++) {
-    const fromName = selected[i];
-    if (fromName === hqTerritory) continue;
-    const path = findPath(fromName, hqTerritory, selectedAdjacency);
-    if (!path || path.length < 2) continue;
-    const hop = path[1];
-    nextHop.set(fromName, hop);
-  }
-  return nextHop;
-}
-
-function moveOneHopPackets(room, selected, messages) {
+/**
+ * Apply storage caps — ONLY to HQ territory.
+ * Non-HQ territories are unlimited pass-through (real Wynncraft behavior).
+ */
+function applyHqStorageCap(room, messages) {
   const hq = room.hqTerritory || '';
   if (!hq) return;
-  const selectedAdjacency = buildSelectedAdjacency(selected, routeGraph);
-  const nextHop = buildNextHopCache(room, selected, hq, selectedAdjacency);
-  const keepFrac = Math.max(0, Math.min(1, 1 - TRADE_ROUTE_TAX_PER_HOP));
-  const arrivals = {};
-  for (let i = 0; i < selected.length; i++) {
-    const territoryName = selected[i];
-    if (territoryName === hq) continue;
-    const hop = nextHop.get(territoryName);
-    if (!hop) {
-      messages.push('No trade route path from ' + territoryName + ' to HQ ' + hq);
-      continue;
-    }
-    const sourceStore = ensurePerTerritoryStorage(room, territoryName);
-    let anyAmount = false;
-    for (let r = 0; r < RESOURCE_KEYS.length; r++) {
-      if (sourceStore[RESOURCE_KEYS[r]] > 0) {
-        anyAmount = true;
-        break;
-      }
-    }
-    if (!anyAmount) continue;
-    if (!arrivals[hop]) arrivals[hop] = createResources();
-    for (let r = 0; r < RESOURCE_KEYS.length; r++) {
-      const key = RESOURCE_KEYS[r];
-      const amt = Number(sourceStore[key]) || 0;
-      const moved = Math.floor(amt * keepFrac);
-      sourceStore[key] = 0;
-      arrivals[hop][key] += moved;
-    }
-  }
-  Object.keys(arrivals).forEach(function (destination) {
-    const store = ensurePerTerritoryStorage(room, destination);
-    const packet = arrivals[destination];
-    for (let r = 0; r < RESOURCE_KEYS.length; r++) {
-      const key = RESOURCE_KEYS[r];
-      store[key] += packet[key];
-    }
-  });
-}
-
-function applyUpgradeDrain(room, territoryNames, messages) {
-  const tickHours = room.tickIntervalMs / 3600000;
-  for (let i = 0; i < territoryNames.length; i++) {
-    const territoryName = territoryNames[i];
-    const upgrades = ensureTerritoryUpgradeShape(room, territoryName);
-    const storage = ensurePerTerritoryStorage(room, territoryName);
-    const active = {};
-    const inactive = {};
-    for (let c = 0; c < UPGRADE_CATEGORIES.length; c++) {
-      const category = UPGRADE_CATEGORIES[c];
-      if (category === 'storage') continue;
-      const level = clamp(parseInt(upgrades[category] || 0, 10) || 0, 0, 11);
-      if (!level) continue;
-      const resourceKey = UPGRADE_RESOURCE_BY_CATEGORY[category];
-      const hourlyCost = UPGRADE_COSTS[category][level] || 0;
-      const perTickCost = hourlyCost * tickHours;
-      const current = Number(storage[resourceKey] || 0);
-      if (perTickCost <= 0) {
-        active[category] = level;
-        continue;
-      }
-      if (current >= perTickCost) {
-        storage[resourceKey] = current - perTickCost;
-        active[category] = level;
-      } else if (current > 0) {
-        storage[resourceKey] = 0;
-        inactive[category] = level;
-      } else {
-        inactive[category] = level;
-      }
-    }
-    const activeParts = [];
-    const inactiveParts = [];
-    if (active.damage) activeParts.push('D' + active.damage);
-    if (active.attackSpeed) activeParts.push('AS' + active.attackSpeed);
-    if (active.health) activeParts.push('H' + active.health);
-    if (active.defense) activeParts.push('DEF' + active.defense);
-    if (inactive.damage) inactiveParts.push('D' + inactive.damage);
-    if (inactive.attackSpeed) inactiveParts.push('AS' + inactive.attackSpeed);
-    if (inactive.health) inactiveParts.push('H' + inactive.health);
-    if (inactive.defense) inactiveParts.push('DEF' + inactive.defense);
-    if (activeParts.length || inactiveParts.length) {
-      let line = territoryName + ' upgrades';
-      if (activeParts.length) line += ' active(' + activeParts.join(',') + ')';
-      if (inactiveParts.length) line += ' inactive(' + inactiveParts.join(',') + ')';
-      messages.push(line);
+  const store = room.perTerritoryStorage[hq];
+  if (!store) return;
+  const storageLevel = getStorageLevel(room, hq);
+  for (let r = 0; r < RESOURCE_KEYS.length; r++) {
+    const key = RESOURCE_KEYS[r];
+    const cap = hqStorageCapacity(storageLevel, key);
+    if (store[key] > cap) {
+      const overflow = Math.floor(store[key] - cap);
+      store[key] = cap;
+      if (overflow > 0) messages.push('HQ overflow: voided ' + overflow.toLocaleString() + ' ' + key);
     }
   }
 }
 
-function syncDefenderResourcesFromHq(room) {
-  const hq = room.hqTerritory || '';
-  if (!hq || !room.perTerritoryStorage[hq]) {
-    room.defenderResources = createResources();
-    return;
-  }
-  const src = room.perTerritoryStorage[hq];
-  room.defenderResources = {
-    emeralds: Math.floor(src.emeralds || 0),
-    wood: Math.floor(src.wood || 0),
-    ore: Math.floor(src.ore || 0),
-    crops: Math.floor(src.crops || 0),
-    fish: Math.floor(src.fish || 0)
-  };
+// ─── Treasury Bonus ───────────────────────────────────────────────────────────
+function getTreasuryBonus(room, territoryName) {
+  const heldSince = room.territoryHeldSince && room.territoryHeldSince[territoryName];
+  if (!heldSince) return 0;
+  const hoursHeld = (Date.now() - heldSince) / 3600000;
+  return Math.min(TREASURY_BONUS_MAX, Math.floor(hoursHeld) * TREASURY_BONUS_PER_HOUR);
 }
 
-function runEcoTick(roomId) {
-  const room = rooms.get(roomId);
-  if (!room) return;
-  if (room.status !== 'prep' && room.status !== 'playing') return;
-  const messages = [];
-  const selected = Array.isArray(room.selectedTerritories) ? room.selectedTerritories : [];
-  if (!selected.length) {
-    messages.push('No selected territories to simulate.');
-    syncDefenderResourcesFromHq(room);
-    io.to(roomId).emit('tick:update', {
-      defenderResources: room.defenderResources,
-      perTerritoryStorage: room.perTerritoryStorage,
-      messages,
-      nextTickInMs: room.tickIntervalMs,
-      serverNow: Date.now(),
-      hqTerritory: room.hqTerritory || '',
-      tickCount: room.tickCount
-    });
-    return;
-  }
-  if (!room.hqTerritory || selected.indexOf(room.hqTerritory) === -1) {
-    room.hqTerritory = selected[0];
-  }
-
-  const selectedSet = new Set(selected);
-  Object.keys(room.perTerritoryStorage).forEach(function (territoryName) {
-    if (!selectedSet.has(territoryName)) {
-      delete room.perTerritoryStorage[territoryName];
-    }
-  });
-  for (let i = 0; i < selected.length; i++) {
-    ensurePerTerritoryStorage(room, selected[i]);
-  }
-
-  for (let i = 0; i < selected.length; i++) {
-    const territoryName = selected[i];
-    const territory = territoryByName.get(territoryName);
-    if (!territory) {
-      messages.push('Missing territory data: ' + territoryName);
-      continue;
-    }
-    const localStore = ensurePerTerritoryStorage(room, territoryName);
-    const mult = clamp(
-      Number(room.productionMultiplier) || 1,
-      PRODUCTION_MULT_MIN,
-      PRODUCTION_MULT_MAX
-    );
-    localStore.emeralds += Math.floor(territory.resources.emeralds * mult);
-    localStore.wood += Math.floor(territory.resources.wood * mult);
-    localStore.ore += Math.floor(territory.resources.ore * mult);
-    localStore.crops += Math.floor(territory.resources.crops * mult);
-    localStore.fish += Math.floor(territory.resources.fish * mult);
-  }
-
-  applyVoidCaps(room, selected, messages);
-  moveOneHopPackets(room, selected, messages);
-  applyVoidCaps(room, selected, messages);
-  applyUpgradeDrain(room, selected, messages);
-  applyVoidCaps(room, selected, messages);
-  syncDefenderResourcesFromHq(room);
-  room.tickCount += 1;
-  room.nextTickAt = Date.now() + room.tickIntervalMs;
-
-  io.to(roomId).emit('tick:update', {
-    defenderResources: room.defenderResources,
-    perTerritoryStorage: room.perTerritoryStorage,
-    messages,
-    nextTickInMs: room.tickIntervalMs,
-    serverNow: Date.now(),
-    hqTerritory: room.hqTerritory,
-    tickCount: room.tickCount
-  });
-  emitRoomState(roomId);
-}
-
-function startTickLoop(roomId) {
-  const room = rooms.get(roomId);
-  if (!room || room.tickTimer) return;
-  room.nextTickAt = Date.now() + room.tickIntervalMs;
-  room.tickTimer = setInterval(function () {
-    runEcoTick(roomId);
-  }, room.tickIntervalMs);
-}
-
-function startPrepCountdown(roomId) {
-  const room = rooms.get(roomId);
-  if (!room) return;
-  stopPrepTicker(room);
-  room.status = 'prep';
-  room.prepSecondsRemaining = PREP_SECONDS;
-  io.to(roomId).emit('statusChanged', { status: room.status });
-  io.to(roomId).emit('prepTick', { secondsRemaining: room.prepSecondsRemaining });
-  emitRoomState(roomId);
-  startTickLoop(roomId);
-  room.prepTimer = setInterval(function () {
-    const activeRoom = rooms.get(roomId);
-    if (!activeRoom) return;
-    activeRoom.prepSecondsRemaining -= 1;
-    io.to(roomId).emit('prepTick', { secondsRemaining: activeRoom.prepSecondsRemaining });
-    emitRoomState(roomId);
-    if (activeRoom.prepSecondsRemaining <= 0) {
-      stopPrepTicker(activeRoom);
-      activeRoom.status = 'playing';
-      activeRoom.prepSecondsRemaining = 0;
-      io.to(roomId).emit('statusChanged', { status: activeRoom.status });
-      emitRoomState(roomId);
-    }
-  }, 1000);
-}
-
-function cleanupRoomIfEmpty(roomId) {
-  const room = rooms.get(roomId);
-  if (!room) return;
-  if (!hasRolePresence(room, 'defender') && !hasRolePresence(room, 'attacker')) {
-    stopPrepTicker(room);
-    stopTickLoop(room);
-    if (room.defenderDisconnectTimer) {
-      clearTimeout(room.defenderDisconnectTimer);
-      room.defenderDisconnectTimer = null;
-    }
-    if (room.attackerDisconnectTimer) {
-      clearTimeout(room.attackerDisconnectTimer);
-      room.attackerDisconnectTimer = null;
-    }
-    rooms.delete(roomId);
-    metrics.roomDeleteTotal += 1;
-    logEvent('room_deleted', { roomId });
-  }
-}
-
-function roleTokenField(role) {
-  return role === 'defender' ? 'defenderSessionToken' : 'attackerSessionToken';
-}
-
-function roleSocketField(role) {
-  return role === 'defender' ? 'defenderSocketId' : 'attackerSocketId';
-}
-
-function rolePendingField(role) {
-  return role === 'defender' ? 'defenderPendingDisconnectAt' : 'attackerPendingDisconnectAt';
-}
-
-function roleTimerField(role) {
-  return role === 'defender' ? 'defenderDisconnectTimer' : 'attackerDisconnectTimer';
-}
-
-function clearDisconnectGrace(room, role) {
-  const timerField = roleTimerField(role);
-  const pendingField = rolePendingField(role);
-  if (room[timerField]) {
-    clearTimeout(room[timerField]);
-    room[timerField] = null;
-  }
-  room[pendingField] = null;
-}
-
-function scheduleDisconnectGrace(roomId, role) {
-  const room = rooms.get(roomId);
-  if (!room) return;
-  const pendingField = rolePendingField(role);
-  const timerField = roleTimerField(role);
-  clearDisconnectGrace(room, role);
-  room[pendingField] = Date.now();
-  room[timerField] = setTimeout(function () {
-    const activeRoom = rooms.get(roomId);
-    if (!activeRoom) return;
-    const activeSocketField = roleSocketField(role);
-    const activePendingField = rolePendingField(role);
-    const activeTimerField = roleTimerField(role);
-    if (activeRoom[activeSocketField]) return;
-    activeRoom[activePendingField] = null;
-    activeRoom[activeTimerField] = null;
-    if (role === 'attacker') {
-      activeRoom.attackerSessionToken = '';
-    }
-    metrics.graceExpiryTotal += 1;
-    logEvent('grace_expired', { roomId, role });
-    resetRoomOnPlayerLeave(activeRoom);
-    emitRoomState(roomId);
-    cleanupRoomIfEmpty(roomId);
-  }, DISCONNECT_GRACE_MS);
-}
-
-function resetRoomOnPlayerLeave(room) {
-  room.defenderReady = false;
-  room.attackerReady = false;
-  if (room.status === 'prep' || room.status === 'playing') {
-    stopPrepTicker(room);
-    stopTickLoop(room);
-    room.status = 'lobby';
-    room.prepSecondsRemaining = null;
-    io.to(room.id).emit('statusChanged', { status: room.status });
-  }
-}
-
-function normalizeUpgradeLevel(value) {
-  return clamp(parseInt(value || 0, 10) || 0, 0, 11);
-}
+// ─── Upgrade Shape Normalisation ─────────────────────────────────────────────
+function normalizeUpgradeLevel(value) { return clamp(parseInt(value || 0, 10) || 0, 0, 11); }
 
 function ensureTerritoryUpgradeShape(room, territoryName) {
   if (!room.territoryUpgrades[territoryName]) {
-    room.territoryUpgrades[territoryName] = {
-      damage: 0,
-      attackSpeed: 0,
-      health: 0,
-      defense: 0,
-      storage: 0
-    };
+    room.territoryUpgrades[territoryName] = { damage: 0, attackSpeed: 0, health: 0, defense: 0, storage: 0 };
   } else {
     const row = room.territoryUpgrades[territoryName];
     row.damage = normalizeUpgradeLevel(row.damage);
@@ -911,88 +451,424 @@ function ensureTerritoryUpgradeShape(room, territoryName) {
   return room.territoryUpgrades[territoryName];
 }
 
-function applyUpgrade(room, territoryName, category) {
-  const resourceKey = UPGRADE_RESOURCE_BY_CATEGORY[category];
-  if (!resourceKey) {
-    return { ok: false, error: 'Invalid upgrade category.' };
+function ensureTerritoryBonusShape(room, territoryName) {
+  if (!room.territoryBonuses[territoryName]) {
+    room.territoryBonuses[territoryName] = createTerritoryBonuses();
+  } else {
+    const row = room.territoryBonuses[territoryName];
+    Object.keys(BONUS_DEFS).forEach(function (key) {
+      row[key] = clamp(parseInt(row[key] || 0, 10) || 0, 0, BONUS_DEFS[key].maxLevel);
+    });
   }
-  const upgrades = ensureTerritoryUpgradeShape(room, territoryName);
-  const currentLevel = normalizeUpgradeLevel(upgrades[category]);
-  if (currentLevel >= 11) {
-    return { ok: false, error: category + ' is already at max level.' };
-  }
-  const nextLevel = currentLevel + 1;
-  const hourlyCost = category === 'storage'
-    ? 0
-    : (UPGRADE_COSTS[category][nextLevel] || 0);
-  const storageCosts = category === 'storage'
-    ? {
-        emeralds: STORAGE_COSTS.emeralds[nextLevel] || 0,
-        wood: STORAGE_COSTS.wood[nextLevel] || 0
+  return room.territoryBonuses[territoryName];
+}
+
+// ─── Upgrade/Bonus Drain ──────────────────────────────────────────────────────
+function applyUpgradeDrain(room, territoryNames, messages) {
+  const tickHours = room.tickIntervalMs / 3600000;
+  for (let i = 0; i < territoryNames.length; i++) {
+    const name = territoryNames[i];
+    const upgrades = ensureTerritoryUpgradeShape(room, name);
+    const storage = ensurePerTerritoryStorage(room, name);
+    const active = [], inactive = [];
+    for (let c = 0; c < UPGRADE_CATEGORIES.length; c++) {
+      const category = UPGRADE_CATEGORIES[c];
+      if (category === 'storage') continue;
+      const level = clamp(parseInt(upgrades[category] || 0, 10) || 0, 0, 11);
+      if (!level) continue;
+      const resourceKey = UPGRADE_RESOURCE_BY_CATEGORY[category];
+      const hourlyCost = UPGRADE_COSTS_PER_LEVEL[level] || 0;
+      const perTickCost = hourlyCost * tickHours;
+      const current = Number(storage[resourceKey] || 0);
+      if (perTickCost <= 0) { active.push(category[0].toUpperCase() + level); continue; }
+      if (current >= perTickCost) {
+        storage[resourceKey] = current - perTickCost;
+        active.push(category[0].toUpperCase() + level);
+      } else {
+        storage[resourceKey] = 0;
+        inactive.push(category[0].toUpperCase() + level);
       }
-    : null;
-  upgrades[category] = nextLevel;
-  return {
-    ok: true,
-    territoryName,
-    category,
-    level: nextLevel,
-    resourceKey,
-    hourlyCost,
-    storageCosts
+    }
+    let line = name;
+    if (active.length) line += ' ✓(' + active.join(',') + ')';
+    if (inactive.length) line += ' ✗INACTIVE(' + inactive.join(',') + ')';
+    if (active.length || inactive.length) messages.push(line);
+  }
+}
+
+function applyBonusDrain(room, territoryNames, messages) {
+  const tickHours = room.tickIntervalMs / 3600000;
+  const bonusKeys = Object.keys(BONUS_DEFS);
+  for (let i = 0; i < territoryNames.length; i++) {
+    const name = territoryNames[i];
+    const bonuses = ensureTerritoryBonusShape(room, name);
+    const storage = ensurePerTerritoryStorage(room, name);
+    const failed = [];
+    for (let b = 0; b < bonusKeys.length; b++) {
+      const bonusKey = bonusKeys[b];
+      const level = bonuses[bonusKey] || 0;
+      if (!level) continue;
+      const def = BONUS_DEFS[bonusKey];
+      const hourlyCost = def.costs[level] || 0;
+      const perTickCost = hourlyCost * tickHours;
+      const resourceKey = def.resource;
+      const current = Number(storage[resourceKey] || 0);
+      if (perTickCost <= 0) continue;
+      if (current >= perTickCost) {
+        storage[resourceKey] = current - perTickCost;
+      } else {
+        storage[resourceKey] = 0;
+        failed.push(bonusKey);
+      }
+    }
+    if (failed.length) {
+      messages.push(name + ' bonus drain failed: ' + failed.join(', '));
+    }
+  }
+}
+
+// ─── HQ Resource Sync ─────────────────────────────────────────────────────────
+function syncDefenderResourcesFromHq(room) {
+  const hq = room.hqTerritory || '';
+  if (!hq || !room.perTerritoryStorage[hq]) { room.defenderResources = createResources(); return; }
+  const src = room.perTerritoryStorage[hq];
+  room.defenderResources = {
+    emeralds: Math.floor(src.emeralds || 0),
+    wood:     Math.floor(src.wood     || 0),
+    ore:      Math.floor(src.ore      || 0),
+    crops:    Math.floor(src.crops    || 0),
+    fish:     Math.floor(src.fish     || 0)
   };
 }
 
+// ─── Resource Movement ────────────────────────────────────────────────────────
+function moveOneHopPackets(room, selected, messages) {
+  const hq = room.hqTerritory || '';
+  if (!hq) return;
+  const selectedAdjacency = buildSelectedAdjacency(selected);
+  const arrivals = {};
+  for (let i = 0; i < selected.length; i++) {
+    const name = selected[i];
+    if (name === hq) continue;
+    const mode = (room.territoryRouteMode && room.territoryRouteMode[name]) || room.routeMode || 'fastest';
+    const findPath = mode === 'cheapest' ? findSelectedOnlyPathToHqCheapest : findSelectedOnlyPathToHq;
+    const path = findPath(name, hq, selectedAdjacency);
+    if (!path || path.length < 2) { messages.push('No route from ' + name + ' to HQ ' + hq); continue; }
+    const hop = path[1];
+    const sourceStore = ensurePerTerritoryStorage(room, name);
+    let anyAmount = false;
+    for (let r = 0; r < RESOURCE_KEYS.length; r++) { if (sourceStore[RESOURCE_KEYS[r]] > 0) { anyAmount = true; break; } }
+    if (!anyAmount) continue;
+    if (!arrivals[hop]) arrivals[hop] = createResources();
+    for (let r = 0; r < RESOURCE_KEYS.length; r++) {
+      const key = RESOURCE_KEYS[r];
+      arrivals[hop][key] += Number(sourceStore[key]) || 0;
+      sourceStore[key] = 0;
+    }
+  }
+  Object.keys(arrivals).forEach(function (dest) {
+    const store = ensurePerTerritoryStorage(room, dest);
+    const packet = arrivals[dest];
+    for (let r = 0; r < RESOURCE_KEYS.length; r++) { store[RESOURCE_KEYS[r]] += packet[RESOURCE_KEYS[r]]; }
+  });
+}
+
+// ─── Combat System ────────────────────────────────────────────────────────────
+function calcTowerStats(room) {
+  const hq = room.hqTerritory || (room.selectedTerritories && room.selectedTerritories[0]) || '';
+  const defaultStats = { towerHP: TOWER_BASE_HP, effectiveHP: TOWER_BASE_HP, connections: 0, healthLevel: 0, defenseLevel: 0, hq };
+  if (!hq) return defaultStats;
+  const upgrades = (room.territoryUpgrades && room.territoryUpgrades[hq]) || {};
+  const healthLevel  = clamp(parseInt(upgrades.health  || 0, 10) || 0, 0, 11);
+  const defenseLevel = clamp(parseInt(upgrades.defense || 0, 10) || 0, 0, 11);
+  const selected = room.selectedTerritories || [];
+  const selectedSet = new Set(selected);
+  const hqTradeRoutes = (territoryByName.get(hq) || {}).tradeRoutes || [];
+  const connections = hqTradeRoutes.filter(t => t !== hq && selectedSet.has(t)).length;
+  const healthMultiplier = 1 + (healthLevel  * 0.25);
+  const connectionBonus  = 1 + (0.3 * connections);
+  const towerHP = Math.floor(TOWER_BASE_HP * healthMultiplier * connectionBonus);
+  // Defense: each level = 5% damage reduction, capped at 80% (so EHP = HP / (1 - reduction))
+  const defenseReduction = Math.min(0.80, defenseLevel * 0.05);
+  const effectiveHP = Math.floor(towerHP / (1 - defenseReduction));
+  return { towerHP, effectiveHP, connections, healthLevel, defenseLevel, hq };
+}
+
+function calcWarTime(effectiveHP, dps) {
+  const rawSeconds = Math.ceil(effectiveHP / dps);
+  return rawSeconds + WAR_GRACE_SECONDS;
+}
+
+function calcAllWarEstimates(room) {
+  const towerStats = calcTowerStats(room);
+  const estimates = {};
+  Object.keys(WAR_ATTACK_TYPES).forEach(function (type) {
+    const dps = WAR_ATTACK_TYPES[type].dps;
+    const warTimeSeconds = calcWarTime(towerStats.effectiveHP, dps);
+    estimates[type] = { warTimeSeconds, dps };
+  });
+  return { towerStats, estimates };
+}
+
+// ─── Eco Tick ─────────────────────────────────────────────────────────────────
+function runEcoTick(roomId) {
+  const room = rooms.get(roomId);
+  if (!room) return;
+  if (room.status !== 'prep' && room.status !== 'playing') return;
+  const messages = [];
+  const selected = Array.isArray(room.selectedTerritories) ? room.selectedTerritories : [];
+  if (!selected.length) {
+    syncDefenderResourcesFromHq(room);
+    io.to(roomId).emit('tick:update', {
+      defenderResources: room.defenderResources, perTerritoryStorage: room.perTerritoryStorage,
+      messages: ['No territories selected.'], nextTickInMs: room.tickIntervalMs,
+      serverNow: Date.now(), hqTerritory: room.hqTerritory || '', tickCount: room.tickCount
+    });
+    return;
+  }
+  if (!room.hqTerritory || selected.indexOf(room.hqTerritory) === -1) {
+    room.hqTerritory = selected[0];
+  }
+  const selectedSet = new Set(selected);
+  // Remove storage for deselected territories
+  Object.keys(room.perTerritoryStorage).forEach(function (name) {
+    if (!selectedSet.has(name)) delete room.perTerritoryStorage[name];
+  });
+  for (let i = 0; i < selected.length; i++) { ensurePerTerritoryStorage(room, selected[i]); }
+
+  // 1. Produce resources per territory (with treasury + production bonuses)
+  for (let i = 0; i < selected.length; i++) {
+    const name = selected[i];
+    const territory = territoryByName.get(name);
+    if (!territory) { messages.push('No data for: ' + name); continue; }
+    const localStore = ensurePerTerritoryStorage(room, name);
+    const bonuses = ensureTerritoryBonusShape(room, name);
+    const treasuryBonus = getTreasuryBonus(room, name);
+    const resProdBonus = bonuses.resourceProduction * RESOURCE_PROD_BONUS_PER_LEVEL;
+    const emProdBonus  = bonuses.emeraldProduction  * EMERALD_PROD_BONUS_PER_LEVEL;
+    const resMult = 1 + treasuryBonus + resProdBonus;
+    const emMult  = 1 + treasuryBonus + emProdBonus;
+    localStore.emeralds += Math.floor(territory.resources.emeralds * emMult);
+    localStore.wood     += Math.floor(territory.resources.wood     * resMult);
+    localStore.ore      += Math.floor(territory.resources.ore      * resMult);
+    localStore.crops    += Math.floor(territory.resources.crops    * resMult);
+    localStore.fish     += Math.floor(territory.resources.fish     * resMult);
+  }
+
+  // 2. Move resources one hop toward HQ (no tax — all defender's own territories)
+  moveOneHopPackets(room, selected, messages);
+
+  // 3. Cap HQ only
+  applyHqStorageCap(room, messages);
+
+  // 4. Upgrade drain
+  applyUpgradeDrain(room, selected, messages);
+
+  // 5. Bonus drain
+  applyBonusDrain(room, selected, messages);
+
+  // 6. Final HQ cap after drains
+  applyHqStorageCap(room, messages);
+
+  // 7. Sync defender HQ resources
+  syncDefenderResourcesFromHq(room);
+
+  room.tickCount += 1;
+  room.nextTickAt = Date.now() + room.tickIntervalMs;
+  io.to(roomId).emit('tick:update', {
+    defenderResources: room.defenderResources,
+    perTerritoryStorage: room.perTerritoryStorage,
+    messages, nextTickInMs: room.tickIntervalMs,
+    serverNow: Date.now(), hqTerritory: room.hqTerritory, tickCount: room.tickCount
+  });
+  emitRoomState(roomId);
+}
+
+// ─── Timers ───────────────────────────────────────────────────────────────────
+function stopPrepTicker(room) { if (room.prepTimer) { clearInterval(room.prepTimer); room.prepTimer = null; } }
+function stopTickLoop(room) { if (room.tickTimer) { clearInterval(room.tickTimer); room.tickTimer = null; } room.nextTickAt = null; }
+function stopWarTimer(room) { if (room.warTimer) { clearTimeout(room.warTimer); room.warTimer = null; } }
+
+function startTickLoop(roomId) {
+  const room = rooms.get(roomId);
+  if (!room || room.tickTimer) return;
+  room.nextTickAt = Date.now() + room.tickIntervalMs;
+  room.tickTimer = setInterval(function () { runEcoTick(roomId); }, room.tickIntervalMs);
+}
+
+function startWarPhase(roomId) {
+  const room = rooms.get(roomId);
+  if (!room) return;
+  const warType = room.attackerWarType || 'normal';
+  const attackDef = WAR_ATTACK_TYPES[warType] || WAR_ATTACK_TYPES.normal;
+  const towerStats = calcTowerStats(room);
+  const warTimeSeconds = calcWarTime(towerStats.effectiveHP, attackDef.dps);
+  room.warTimeSeconds = warTimeSeconds;
+  room.warStartedAt   = Date.now();
+  room.warTowerStats  = {
+    hq: towerStats.hq, towerHP: towerStats.towerHP, effectiveHP: towerStats.effectiveHP,
+    connections: towerStats.connections, healthLevel: towerStats.healthLevel, defenseLevel: towerStats.defenseLevel,
+    attackerWarType: warType, attackerDPS: attackDef.dps, warTimeSeconds, gracePeriod: WAR_GRACE_SECONDS
+  };
+  io.to(roomId).emit('war:started', room.warTowerStats);
+  emitRoomState(roomId);
+  stopWarTimer(room);
+  room.warTimer = setTimeout(function () {
+    const activeRoom = rooms.get(roomId);
+    if (!activeRoom || activeRoom.status !== 'playing') return;
+    activeRoom.warResult = 'attacker_wins';
+    io.to(roomId).emit('war:ended', { result: 'attacker_wins', warTowerStats: activeRoom.warTowerStats });
+    emitRoomState(roomId);
+    logEvent('war_ended', { roomId, result: 'attacker_wins', warTimeSeconds });
+  }, warTimeSeconds * 1000);
+  logEvent('war_started', { roomId, warType, warTimeSeconds, towerHP: towerStats.towerHP, effectiveHP: towerStats.effectiveHP });
+}
+
+function startPrepCountdown(roomId) {
+  const room = rooms.get(roomId);
+  if (!room) return;
+  stopPrepTicker(room);
+  room.status = 'prep';
+  room.prepSecondsRemaining = PREP_SECONDS;
+  io.to(roomId).emit('statusChanged', { status: room.status });
+  emitRoomState(roomId);
+  startTickLoop(roomId);
+  room.prepTimer = setInterval(function () {
+    const activeRoom = rooms.get(roomId);
+    if (!activeRoom) return;
+    activeRoom.prepSecondsRemaining -= 1;
+    // Broadcast live war estimates during prep so attacker panel can update
+    const { towerStats, estimates } = calcAllWarEstimates(activeRoom);
+    io.to(roomId).emit('prepTick', {
+      secondsRemaining: activeRoom.prepSecondsRemaining,
+      warEstimates: { towerStats, estimates }
+    });
+    emitRoomState(roomId);
+    if (activeRoom.prepSecondsRemaining <= 0) {
+      stopPrepTicker(activeRoom);
+      activeRoom.status = 'playing';
+      activeRoom.prepSecondsRemaining = 0;
+      io.to(roomId).emit('statusChanged', { status: activeRoom.status });
+      emitRoomState(roomId);
+      startWarPhase(roomId);
+    }
+  }, 1000);
+}
+
+// ─── Room Lifecycle ────────────────────────────────────────────────────────────
+function hasRolePresence(room, role) {
+  if (role === 'defender') return !!room.defenderSocketId || !!room.defenderPendingDisconnectAt;
+  if (role === 'attacker') return !!room.attackerSocketId || !!room.attackerPendingDisconnectAt;
+  return false;
+}
+function cleanupRoomIfEmpty(roomId) {
+  const room = rooms.get(roomId);
+  if (!room) return;
+  if (!hasRolePresence(room, 'defender') && !hasRolePresence(room, 'attacker')) {
+    stopPrepTicker(room); stopTickLoop(room); stopWarTimer(room);
+    if (room.defenderDisconnectTimer) { clearTimeout(room.defenderDisconnectTimer); room.defenderDisconnectTimer = null; }
+    if (room.attackerDisconnectTimer) { clearTimeout(room.attackerDisconnectTimer); room.attackerDisconnectTimer = null; }
+    rooms.delete(roomId);
+    metrics.roomDeleteTotal += 1;
+    logEvent('room_deleted', { roomId });
+  }
+}
+function roleSocketField(role)  { return role === 'defender' ? 'defenderSocketId' : 'attackerSocketId'; }
+function rolePendingField(role) { return role === 'defender' ? 'defenderPendingDisconnectAt' : 'attackerPendingDisconnectAt'; }
+function roleTimerField(role)   { return role === 'defender' ? 'defenderDisconnectTimer' : 'attackerDisconnectTimer'; }
+function roleTokenField(role)   { return role === 'defender' ? 'defenderSessionToken' : 'attackerSessionToken'; }
+function clearDisconnectGrace(room, role) {
+  const timerField = roleTimerField(role);
+  if (room[timerField]) { clearTimeout(room[timerField]); room[timerField] = null; }
+  room[rolePendingField(role)] = null;
+}
+function scheduleDisconnectGrace(roomId, role) {
+  const room = rooms.get(roomId);
+  if (!room) return;
+  clearDisconnectGrace(room, role);
+  room[rolePendingField(role)] = Date.now();
+  room[roleTimerField(role)] = setTimeout(function () {
+    const activeRoom = rooms.get(roomId);
+    if (!activeRoom) return;
+    if (activeRoom[roleSocketField(role)]) return;
+    activeRoom[rolePendingField(role)] = null;
+    activeRoom[roleTimerField(role)] = null;
+    if (role === 'attacker') activeRoom.attackerSessionToken = '';
+    metrics.graceExpiryTotal += 1;
+    logEvent('grace_expired', { roomId, role });
+    resetRoomOnPlayerLeave(activeRoom);
+    emitRoomState(roomId);
+    cleanupRoomIfEmpty(roomId);
+  }, DISCONNECT_GRACE_MS);
+}
+function resetRoomOnPlayerLeave(room) {
+  room.defenderReady = false;
+  room.attackerReady = false;
+  if (room.status === 'prep' || room.status === 'playing') {
+    stopPrepTicker(room); stopTickLoop(room); stopWarTimer(room);
+    room.status = 'lobby';
+    room.prepSecondsRemaining = null;
+    room.warTimeSeconds = null; room.warStartedAt = null;
+    room.warResult = null; room.warTowerStats = null;
+    io.to(room.id).emit('statusChanged', { status: room.status });
+  }
+}
+
+// ─── Upgrade / Bonus Application ──────────────────────────────────────────────
+function applyUpgrade(room, territoryName, category) {
+  const resourceKey = UPGRADE_RESOURCE_BY_CATEGORY[category];
+  if (!resourceKey) return { ok: false, error: 'Invalid upgrade category.' };
+  const upgrades = ensureTerritoryUpgradeShape(room, territoryName);
+  const currentLevel = normalizeUpgradeLevel(upgrades[category]);
+  if (currentLevel >= 11) return { ok: false, error: category + ' is already at max level.' };
+  const nextLevel = currentLevel + 1;
+  upgrades[category] = nextLevel;
+  const hourlyCost = category === 'storage' ? 0 : (UPGRADE_COSTS_PER_LEVEL[nextLevel] || 0);
+  return { ok: true, territoryName, category, level: nextLevel, resourceKey, hourlyCost };
+}
+function applyBonus(room, territoryName, bonusKey) {
+  const def = BONUS_DEFS[bonusKey];
+  if (!def) return { ok: false, error: 'Invalid bonus.' };
+  const bonuses = ensureTerritoryBonusShape(room, territoryName);
+  const currentLevel = bonuses[bonusKey] || 0;
+  if (currentLevel >= def.maxLevel) return { ok: false, error: bonusKey + ' already at max.' };
+  const nextLevel = currentLevel + 1;
+  bonuses[bonusKey] = nextLevel;
+  return { ok: true, territoryName, bonusKey, level: nextLevel, resource: def.resource, hourlyCost: def.costs[nextLevel] || 0 };
+}
+
+// ─── Socket Events ────────────────────────────────────────────────────────────
 io.on('connection', function (socket) {
   metrics.connectionsTotal += 1;
   socket.data.clientIp = getClientIp(socket);
-  logEvent('socket_connected', {
-    socketId: socket.id,
-    ip: socket.data.clientIp
-  });
+  logEvent('socket_connected', { socketId: socket.id, ip: socket.data.clientIp });
 
+  // ── createRoom ──────────────────────────────────────────────────────────────
   socket.on('createRoom', function (_, ack) {
     if (!requirePrivilegedAccess(socket, ack, 'createRoom')) return;
-    if (!allowEventRate(socket, 'createRoom')) {
-      if (typeof ack === 'function') ack({ ok: false, error: 'Too many requests. Try again shortly.' });
-      return;
-    }
+    if (!allowEventRate(socket, 'createRoom')) { if (typeof ack === 'function') ack({ ok: false, error: 'Rate limited.' }); return; }
     const roomId = generateRoomId();
-    if (!roomId) {
-      if (typeof ack === 'function') ack({ ok: false, error: 'Failed to allocate room code.' });
-      return;
-    }
+    if (!roomId) { if (typeof ack === 'function') ack({ ok: false, error: 'Failed to allocate room.' }); return; }
     const room = createRoomState(roomId, socket.id);
     rooms.set(roomId, room);
     socket.join(roomId);
     socket.data.roomId = roomId;
     socket.data.role = 'defender';
     metrics.roomCreateTotal += 1;
-    logEvent('room_created', { roomId, socketId: socket.id, ip: socket.data.clientIp });
+    logEvent('room_created', { roomId, socketId: socket.id });
     emitRoomState(roomId);
-    if (typeof ack === 'function') {
-      ack({ ok: true, roomId, role: 'defender', playerToken: room.defenderSessionToken });
-    }
+    if (typeof ack === 'function') ack({ ok: true, roomId, role: 'defender', playerToken: room.defenderSessionToken });
   });
 
+  // ── joinRoom ────────────────────────────────────────────────────────────────
   socket.on('joinRoom', function (payload, ack) {
-    if (!allowEventRate(socket, 'joinRoom')) {
-      if (typeof ack === 'function') ack({ ok: false, error: 'Too many requests. Try again shortly.' });
-      return;
-    }
+    if (!allowEventRate(socket, 'joinRoom')) { if (typeof ack === 'function') ack({ ok: false, error: 'Rate limited.' }); return; }
     const roomId = payload && typeof payload.roomId === 'string' ? payload.roomId.trim() : '';
-    if (!/^\d{6}$/.test(roomId)) {
-      if (typeof ack === 'function') ack({ ok: false, error: 'Room code must be 6 digits.' });
-      return;
-    }
+    if (!/^\d{6}$/.test(roomId)) { if (typeof ack === 'function') ack({ ok: false, error: 'Room code must be 6 digits.' }); return; }
     const room = rooms.get(roomId);
-    if (!room) {
-      if (typeof ack === 'function') ack({ ok: false, error: 'Room not found.' });
-      return;
-    }
+    if (!room) { if (typeof ack === 'function') ack({ ok: false, error: 'Room not found.' }); return; }
     if (room.attackerSocketId && room.attackerSocketId !== socket.id) {
-      if (typeof ack === 'function') ack({ ok: false, error: 'Room already has an attacker.' });
-      return;
+      if (typeof ack === 'function') ack({ ok: false, error: 'Room already full.' }); return;
     }
     room.attackerSocketId = socket.id;
     room.attackerSessionToken = crypto.randomBytes(16).toString('hex');
@@ -1002,283 +878,248 @@ io.on('connection', function (socket) {
     socket.data.roomId = roomId;
     socket.data.role = 'attacker';
     metrics.roomJoinTotal += 1;
-    logEvent('room_joined', { roomId, socketId: socket.id, ip: socket.data.clientIp });
+    logEvent('room_joined', { roomId, socketId: socket.id });
     emitRoomState(roomId);
-    if (typeof ack === 'function') {
-      ack({ ok: true, roomId, role: 'attacker', playerToken: room.attackerSessionToken });
-    }
+    if (typeof ack === 'function') ack({ ok: true, roomId, role: 'attacker', playerToken: room.attackerSessionToken });
   });
 
+  // ── resumeRoom ──────────────────────────────────────────────────────────────
   socket.on('resumeRoom', function (payload, ack) {
     if (!requirePrivilegedAccess(socket, ack, 'resumeRoom')) return;
-    if (!allowEventRate(socket, 'resumeRoom')) {
-      if (typeof ack === 'function') ack({ ok: false, error: 'Too many requests. Try again shortly.' });
-      return;
-    }
+    if (!allowEventRate(socket, 'resumeRoom')) { if (typeof ack === 'function') ack({ ok: false, error: 'Rate limited.' }); return; }
     const roomId = payload && typeof payload.roomId === 'string' ? payload.roomId.trim() : '';
     const playerToken = payload && typeof payload.playerToken === 'string' ? payload.playerToken.trim() : '';
-    if (!/^\d{6}$/.test(roomId) || !playerToken) {
-      metrics.resumeFailTotal += 1;
-      if (typeof ack === 'function') ack({ ok: false, error: 'Invalid resume payload.' });
-      return;
-    }
+    if (!/^\d{6}$/.test(roomId) || !playerToken) { metrics.resumeFailTotal += 1; if (typeof ack === 'function') ack({ ok: false, error: 'Invalid payload.' }); return; }
     const room = rooms.get(roomId);
-    if (!room) {
-      metrics.resumeFailTotal += 1;
-      if (typeof ack === 'function') ack({ ok: false, error: 'Room not found.' });
-      return;
-    }
+    if (!room) { metrics.resumeFailTotal += 1; if (typeof ack === 'function') ack({ ok: false, error: 'Room not found.' }); return; }
     let role = null;
-    if (room.defenderSessionToken && room.defenderSessionToken === playerToken) {
-      role = 'defender';
-    } else if (room.attackerSessionToken && room.attackerSessionToken === playerToken) {
-      role = 'attacker';
-    }
-    if (!role) {
-      metrics.resumeFailTotal += 1;
-      if (typeof ack === 'function') ack({ ok: false, error: 'Resume token invalid.' });
-      return;
-    }
+    if (room.defenderSessionToken && room.defenderSessionToken === playerToken) role = 'defender';
+    else if (room.attackerSessionToken && room.attackerSessionToken === playerToken) role = 'attacker';
+    if (!role) { metrics.resumeFailTotal += 1; if (typeof ack === 'function') ack({ ok: false, error: 'Invalid token.' }); return; }
     room[roleSocketField(role)] = socket.id;
     clearDisconnectGrace(room, role);
     socket.join(roomId);
     socket.data.roomId = roomId;
     socket.data.role = role;
     metrics.resumeSuccessTotal += 1;
-    logEvent('room_resumed', { roomId, role, socketId: socket.id, ip: socket.data.clientIp });
+    logEvent('room_resumed', { roomId, role, socketId: socket.id });
     emitRoomState(roomId);
     if (typeof ack === 'function') ack({ ok: true, roomId, role });
   });
 
+  // ── updateSelection ─────────────────────────────────────────────────────────
   socket.on('updateSelection', function (payload, ack) {
-    if (!allowEventRate(socket, 'updateSelection')) {
-      if (typeof ack === 'function') ack({ ok: false, error: 'Too many requests. Try again shortly.' });
-      return;
-    }
+    if (!allowEventRate(socket, 'updateSelection')) { if (typeof ack === 'function') ack({ ok: false, error: 'Rate limited.' }); return; }
     const roomId = socket.data.roomId;
     const room = roomId ? rooms.get(roomId) : null;
-    if (!room) {
-      if (typeof ack === 'function') ack({ ok: false, error: 'Not in a room.' });
-      return;
-    }
-    if (roleForSocket(room, socket.id) !== 'defender') {
-      if (typeof ack === 'function') ack({ ok: false, error: 'Only defender can update selection.' });
-      return;
-    }
-    if (room.status !== 'lobby') {
-      if (typeof ack === 'function') ack({ ok: false, error: 'Selection can only be edited in lobby.' });
-      return;
-    }
+    if (!room) { if (typeof ack === 'function') ack({ ok: false, error: 'Not in a room.' }); return; }
+    if (roleForSocket(room, socket.id) !== 'defender') { if (typeof ack === 'function') ack({ ok: false, error: 'Defender only.' }); return; }
+    if (room.status !== 'lobby') { if (typeof ack === 'function') ack({ ok: false, error: 'Lobby only.' }); return; }
     const selected = payload && Array.isArray(payload.selectedTerritories)
-      ? payload.selectedTerritories
-        .filter(function (name) {
-          return typeof name === 'string' && name.trim().length > 0;
-        })
-        .map(function (name) {
-          return name.trim();
-        })
+      ? payload.selectedTerritories.filter(n => typeof n === 'string' && n.trim()).map(n => n.trim())
       : [];
-    room.selectedTerritories = Array.from(new Set(selected));
-    room.hqTerritory = room.selectedTerritories[0] || '';
+    const newSelected = Array.from(new Set(selected));
+    const now = Date.now();
+    const prevSelected = new Set(room.selectedTerritories || []);
+    if (!room.territoryHeldSince) room.territoryHeldSince = {};
+    // Track hold-time: newly added gets now; removed gets deleted
+    newSelected.forEach(function (name) { if (!prevSelected.has(name)) room.territoryHeldSince[name] = now; });
+    Object.keys(room.territoryHeldSince).forEach(function (name) {
+      if (!newSelected.includes(name)) delete room.territoryHeldSince[name];
+    });
+    room.selectedTerritories = newSelected;
+    room.hqTerritory = newSelected[0] || '';
     room.defenderReady = false;
     room.attackerReady = false;
     emitRoomState(roomId);
     if (typeof ack === 'function') ack({ ok: true });
   });
 
+  // ── setReady ────────────────────────────────────────────────────────────────
   socket.on('setReady', async function (payload, ack) {
     if (!requirePrivilegedAccess(socket, ack, 'setReady')) return;
-    if (!allowEventRate(socket, 'setReady')) {
-      if (typeof ack === 'function') ack({ ok: false, error: 'Too many requests. Try again shortly.' });
-      return;
-    }
+    if (!allowEventRate(socket, 'setReady')) { if (typeof ack === 'function') ack({ ok: false, error: 'Rate limited.' }); return; }
     const roomId = socket.data.roomId;
     const room = roomId ? rooms.get(roomId) : null;
-    if (!room) {
-      if (typeof ack === 'function') ack({ ok: false, error: 'Not in a room.' });
-      return;
-    }
+    if (!room) { if (typeof ack === 'function') ack({ ok: false, error: 'Not in a room.' }); return; }
     const role = roleForSocket(room, socket.id);
-    if (!role) {
-      if (typeof ack === 'function') ack({ ok: false, error: 'Invalid player role.' });
-      return;
-    }
-    if (room.status !== 'lobby') {
-      if (typeof ack === 'function') ack({ ok: false, error: 'Room is not in lobby state.' });
-      return;
-    }
+    if (!role) { if (typeof ack === 'function') ack({ ok: false, error: 'Invalid role.' }); return; }
+    if (room.status !== 'lobby') { if (typeof ack === 'function') ack({ ok: false, error: 'Lobby only.' }); return; }
     const ready = !!(payload && payload.ready);
     if (role === 'defender') room.defenderReady = ready;
     if (role === 'attacker') room.attackerReady = ready;
     emitRoomState(roomId);
-
     if (room.defenderReady && room.attackerReady) {
-      try {
-        await ensureTerritoryCacheLoaded();
-      } catch (e) {
-        room.defenderReady = false;
-        room.attackerReady = false;
+      try { await ensureTerritoryCacheLoaded(); }
+      catch (e) {
+        room.defenderReady = false; room.attackerReady = false;
         emitRoomState(roomId);
         emitRoomError(roomId, 'Territory cache unavailable: ' + (e instanceof Error ? e.message : String(e)));
-        if (typeof ack === 'function') ack({ ok: false, error: 'Territory cache unavailable.' });
-        return;
+        if (typeof ack === 'function') ack({ ok: false, error: 'Territory cache unavailable.' }); return;
       }
       startPrepCountdown(roomId);
     }
     if (typeof ack === 'function') ack({ ok: true });
   });
 
+  // ── upgrade:apply ───────────────────────────────────────────────────────────
   socket.on('upgrade:apply', function (payload, ack) {
     if (!requirePrivilegedAccess(socket, ack, 'upgrade:apply')) return;
-    if (!allowEventRate(socket, 'upgrade:apply')) {
-      if (typeof ack === 'function') ack({ ok: false, error: 'Too many requests. Try again shortly.' });
-      return;
-    }
+    if (!allowEventRate(socket, 'upgrade:apply')) { if (typeof ack === 'function') ack({ ok: false, error: 'Rate limited.' }); return; }
     const roomId = socket.data.roomId;
     const room = roomId ? rooms.get(roomId) : null;
-    if (!room) {
-      if (typeof ack === 'function') ack({ ok: false, error: 'Not in a room.' });
-      return;
-    }
-    if (room.status !== 'playing' && room.status !== 'prep') {
-      if (typeof ack === 'function') ack({ ok: false, error: 'Upgrades are only available during prep/playing.' });
-      return;
-    }
-    const role = roleForSocket(room, socket.id);
-    if (role !== 'defender') {
-      if (typeof ack === 'function') ack({ ok: false, error: 'Only defender can apply upgrades.' });
-      return;
-    }
-    const territoryName = payload && typeof payload.territoryName === 'string'
-      ? payload.territoryName.trim()
-      : '';
-    const category = payload && typeof payload.category === 'string'
-      ? payload.category.trim()
-      : '';
+    if (!room) { if (typeof ack === 'function') ack({ ok: false, error: 'Not in a room.' }); return; }
+    if (room.status !== 'playing' && room.status !== 'prep') { if (typeof ack === 'function') ack({ ok: false, error: 'Prep/playing only.' }); return; }
+    if (roleForSocket(room, socket.id) !== 'defender') { if (typeof ack === 'function') ack({ ok: false, error: 'Defender only.' }); return; }
+    const territoryName = payload && typeof payload.territoryName === 'string' ? payload.territoryName.trim() : '';
+    const category     = payload && typeof payload.category === 'string' ? payload.category.trim() : '';
     if (!territoryName || room.selectedTerritories.indexOf(territoryName) === -1) {
-      if (typeof ack === 'function') ack({ ok: false, error: 'Territory is not defender-owned in this room.' });
-      return;
+      if (typeof ack === 'function') ack({ ok: false, error: 'Territory not in room.' }); return;
     }
     const result = applyUpgrade(room, territoryName, category);
-    if (!result.ok) {
-      if (typeof ack === 'function') ack(result);
-      return;
-    }
-    io.to(roomId).emit('upgrade:applied', {
-      territoryName: result.territoryName,
-      category: result.category,
-      level: result.level,
-      categoryCost: result.categoryCost,
-      emeraldCost: result.emeraldCost,
-      resourceKey: result.resourceKey,
-      storageCosts: result.storageCosts
-    });
+    if (!result.ok) { if (typeof ack === 'function') ack(result); return; }
+    io.to(roomId).emit('upgrade:applied', result);
     emitRoomState(roomId);
     if (typeof ack === 'function') ack({ ok: true, ...result });
   });
 
-  socket.on('setHqTerritory', function (payload, ack) {
-    if (!requirePrivilegedAccess(socket, ack, 'setHqTerritory')) return;
-    if (!allowEventRate(socket, 'setHqTerritory')) {
-      if (typeof ack === 'function') ack({ ok: false, error: 'Too many requests. Try again shortly.' });
-      return;
-    }
+  // ── bonus:apply ─────────────────────────────────────────────────────────────
+  socket.on('bonus:apply', function (payload, ack) {
+    if (!requirePrivilegedAccess(socket, ack, 'bonus:apply')) return;
+    if (!allowEventRate(socket, 'bonus:apply')) { if (typeof ack === 'function') ack({ ok: false, error: 'Rate limited.' }); return; }
     const roomId = socket.data.roomId;
     const room = roomId ? rooms.get(roomId) : null;
-    if (!room) {
-      if (typeof ack === 'function') ack({ ok: false, error: 'Not in a room.' });
-      return;
-    }
-    if (room.status !== 'prep' && room.status !== 'playing') {
-      if (typeof ack === 'function') ack({ ok: false, error: 'HQ can only be changed during prep/playing.' });
-      return;
-    }
-    const role = roleForSocket(room, socket.id);
-    if (role !== 'defender') {
-      if (typeof ack === 'function') ack({ ok: false, error: 'Only defender can set HQ.' });
-      return;
-    }
-    const territoryName = payload && typeof payload.territoryName === 'string'
-      ? payload.territoryName.trim()
-      : '';
+    if (!room) { if (typeof ack === 'function') ack({ ok: false, error: 'Not in a room.' }); return; }
+    if (room.status !== 'playing' && room.status !== 'prep') { if (typeof ack === 'function') ack({ ok: false, error: 'Prep/playing only.' }); return; }
+    if (roleForSocket(room, socket.id) !== 'defender') { if (typeof ack === 'function') ack({ ok: false, error: 'Defender only.' }); return; }
+    const territoryName = payload && typeof payload.territoryName === 'string' ? payload.territoryName.trim() : '';
+    const bonusKey      = payload && typeof payload.bonusKey === 'string' ? payload.bonusKey.trim() : '';
     if (!territoryName || room.selectedTerritories.indexOf(territoryName) === -1) {
-      if (typeof ack === 'function') ack({ ok: false, error: 'HQ must be one of defender selected territories.' });
-      return;
+      if (typeof ack === 'function') ack({ ok: false, error: 'Territory not in room.' }); return;
+    }
+    const result = applyBonus(room, territoryName, bonusKey);
+    if (!result.ok) { if (typeof ack === 'function') ack(result); return; }
+    io.to(roomId).emit('bonus:applied', result);
+    emitRoomState(roomId);
+    if (typeof ack === 'function') ack({ ok: true, ...result });
+  });
+
+  // ── setTaxRate ──────────────────────────────────────────────────────────────
+  socket.on('setTaxRate', function (payload, ack) {
+    if (!requirePrivilegedAccess(socket, ack, 'setTaxRate')) return;
+    if (!allowEventRate(socket, 'setTaxRate')) { if (typeof ack === 'function') ack({ ok: false, error: 'Rate limited.' }); return; }
+    const roomId = socket.data.roomId;
+    const room = roomId ? rooms.get(roomId) : null;
+    if (!room) { if (typeof ack === 'function') ack({ ok: false, error: 'Not in a room.' }); return; }
+    if (roleForSocket(room, socket.id) !== 'defender') { if (typeof ack === 'function') ack({ ok: false, error: 'Defender only.' }); return; }
+    const territoryName = payload && typeof payload.territoryName === 'string' ? payload.territoryName.trim() : '';
+    if (!territoryName || room.selectedTerritories.indexOf(territoryName) === -1) {
+      if (typeof ack === 'function') ack({ ok: false, error: 'Territory not in room.' }); return;
+    }
+    const enemy = typeof payload.enemy === 'number' ? clamp(payload.enemy, 0.05, 0.40) : 0.30;
+    const ally  = typeof payload.ally  === 'number' ? clamp(payload.ally,  0.05, 0.40) : 0.10;
+    if (!room.territoryTaxRates) room.territoryTaxRates = {};
+    room.territoryTaxRates[territoryName] = { enemy, ally };
+    emitRoomState(roomId);
+    if (typeof ack === 'function') ack({ ok: true, territoryName, enemy, ally });
+  });
+
+  // ── setTerritoryRouteMode ───────────────────────────────────────────────────
+  socket.on('setTerritoryRouteMode', function (payload, ack) {
+    if (!requirePrivilegedAccess(socket, ack, 'setTerritoryRouteMode')) return;
+    if (!allowEventRate(socket, 'setTerritoryRouteMode')) { if (typeof ack === 'function') ack({ ok: false, error: 'Rate limited.' }); return; }
+    const roomId = socket.data.roomId;
+    const room = roomId ? rooms.get(roomId) : null;
+    if (!room) { if (typeof ack === 'function') ack({ ok: false, error: 'Not in a room.' }); return; }
+    if (roleForSocket(room, socket.id) !== 'defender') { if (typeof ack === 'function') ack({ ok: false, error: 'Defender only.' }); return; }
+    const territoryName = payload && typeof payload.territoryName === 'string' ? payload.territoryName.trim() : '';
+    if (!territoryName || room.selectedTerritories.indexOf(territoryName) === -1) {
+      if (typeof ack === 'function') ack({ ok: false, error: 'Territory not in room.' }); return;
+    }
+    const mode = payload && payload.routeMode === 'cheapest' ? 'cheapest' : 'fastest';
+    if (!room.territoryRouteMode) room.territoryRouteMode = {};
+    room.territoryRouteMode[territoryName] = mode;
+    emitRoomState(roomId);
+    if (typeof ack === 'function') ack({ ok: true, territoryName, routeMode: mode });
+  });
+
+  // ── setHqTerritory ──────────────────────────────────────────────────────────
+  socket.on('setHqTerritory', function (payload, ack) {
+    if (!requirePrivilegedAccess(socket, ack, 'setHqTerritory')) return;
+    if (!allowEventRate(socket, 'setHqTerritory')) { if (typeof ack === 'function') ack({ ok: false, error: 'Rate limited.' }); return; }
+    const roomId = socket.data.roomId;
+    const room = roomId ? rooms.get(roomId) : null;
+    if (!room) { if (typeof ack === 'function') ack({ ok: false, error: 'Not in a room.' }); return; }
+    if (room.status !== 'prep' && room.status !== 'playing') { if (typeof ack === 'function') ack({ ok: false, error: 'Prep/playing only.' }); return; }
+    if (roleForSocket(room, socket.id) !== 'defender') { if (typeof ack === 'function') ack({ ok: false, error: 'Defender only.' }); return; }
+    const territoryName = payload && typeof payload.territoryName === 'string' ? payload.territoryName.trim() : '';
+    if (!territoryName || room.selectedTerritories.indexOf(territoryName) === -1) {
+      if (typeof ack === 'function') ack({ ok: false, error: 'Must be one of selected territories.' }); return;
     }
     room.hqTerritory = territoryName;
     emitRoomState(roomId);
     if (typeof ack === 'function') ack({ ok: true, hqTerritory: room.hqTerritory });
   });
 
+  // ── eco:setRouteMode (global fallback, kept for compatibility) ───────────────
   socket.on('eco:setRouteMode', function (payload, ack) {
     if (!requirePrivilegedAccess(socket, ack, 'eco:setRouteMode')) return;
-    if (!allowEventRate(socket, 'eco:setRouteMode')) {
-      if (typeof ack === 'function') ack({ ok: false, error: 'Too many requests. Try again shortly.' });
-      return;
-    }
     const roomId = socket.data.roomId;
     const room = roomId ? rooms.get(roomId) : null;
-    if (!room) {
-      if (typeof ack === 'function') ack({ ok: false, error: 'Not in a room.' });
-      return;
-    }
-    const role = roleForSocket(room, socket.id);
-    if (role !== 'defender') {
-      if (typeof ack === 'function') ack({ ok: false, error: 'Only defender can set route mode.' });
-      return;
-    }
-    const mode = payload && payload.routeMode === 'cheapest' ? 'cheapest' : 'fastest';
-    room.routeMode = mode;
+    if (!room) { if (typeof ack === 'function') ack({ ok: false, error: 'Not in a room.' }); return; }
+    if (roleForSocket(room, socket.id) !== 'defender') { if (typeof ack === 'function') ack({ ok: false, error: 'Defender only.' }); return; }
+    room.routeMode = payload && payload.routeMode === 'cheapest' ? 'cheapest' : 'fastest';
     emitRoomState(roomId);
     if (typeof ack === 'function') ack({ ok: true, routeMode: room.routeMode });
   });
 
+  // ── eco:setProductionMultiplier (kept for compatibility) ────────────────────
   socket.on('eco:setProductionMultiplier', function (payload, ack) {
     if (!requirePrivilegedAccess(socket, ack, 'eco:setProductionMultiplier')) return;
-    if (!allowEventRate(socket, 'eco:setProductionMultiplier')) {
-      if (typeof ack === 'function') ack({ ok: false, error: 'Too many requests. Try again shortly.' });
-      return;
-    }
     const roomId = socket.data.roomId;
     const room = roomId ? rooms.get(roomId) : null;
-    if (!room) {
-      if (typeof ack === 'function') ack({ ok: false, error: 'Not in a room.' });
-      return;
-    }
-    const role = roleForSocket(room, socket.id);
-    if (role !== 'defender') {
-      if (typeof ack === 'function') ack({ ok: false, error: 'Only defender can set production buff.' });
-      return;
-    }
+    if (!room) { if (typeof ack === 'function') ack({ ok: false, error: 'Not in a room.' }); return; }
+    if (roleForSocket(room, socket.id) !== 'defender') { if (typeof ack === 'function') ack({ ok: false, error: 'Defender only.' }); return; }
     const raw = payload && payload.multiplier != null ? Number(payload.multiplier) : NaN;
-    if (!Number.isFinite(raw)) {
-      if (typeof ack === 'function') ack({ ok: false, error: 'Invalid multiplier.' });
-      return;
-    }
+    if (!Number.isFinite(raw)) { if (typeof ack === 'function') ack({ ok: false, error: 'Invalid multiplier.' }); return; }
     room.productionMultiplier = clamp(raw, PRODUCTION_MULT_MIN, PRODUCTION_MULT_MAX);
     emitRoomState(roomId);
-    if (typeof ack === 'function') {
-      ack({ ok: true, productionMultiplier: room.productionMultiplier });
-    }
+    if (typeof ack === 'function') ack({ ok: true, productionMultiplier: room.productionMultiplier });
   });
 
+  // ── attacker:selectWarType ──────────────────────────────────────────────────
+  socket.on('attacker:selectWarType', function (payload, ack) {
+    if (!allowEventRate(socket, 'attacker:selectWarType')) { if (typeof ack === 'function') ack({ ok: false, error: 'Rate limited.' }); return; }
+    const roomId = socket.data.roomId;
+    const room = roomId ? rooms.get(roomId) : null;
+    if (!room) { if (typeof ack === 'function') ack({ ok: false, error: 'Not in a room.' }); return; }
+    if (roleForSocket(room, socket.id) !== 'attacker') { if (typeof ack === 'function') ack({ ok: false, error: 'Attacker only.' }); return; }
+    if (room.status !== 'lobby' && room.status !== 'prep') { if (typeof ack === 'function') ack({ ok: false, error: 'Lobby/prep only.' }); return; }
+    const warType = payload && WAR_ATTACK_TYPES[payload.warType] ? payload.warType : 'normal';
+    room.attackerWarType = warType;
+    const { towerStats, estimates } = calcAllWarEstimates(room);
+    io.to(roomId).emit('war:estimates', { warType, towerStats, estimates });
+    emitRoomState(roomId);
+    if (typeof ack === 'function') ack({ ok: true, warType, estimates });
+  });
+
+  // ── war:getEstimates ────────────────────────────────────────────────────────
+  socket.on('war:getEstimates', function (_, ack) {
+    const roomId = socket.data.roomId;
+    const room = roomId ? rooms.get(roomId) : null;
+    if (!room) { if (typeof ack === 'function') ack({ ok: false, error: 'Not in a room.' }); return; }
+    const { towerStats, estimates } = calcAllWarEstimates(room);
+    if (typeof ack === 'function') ack({ ok: true, towerStats, estimates });
+  });
+
+  // ── leaveRoom ───────────────────────────────────────────────────────────────
   socket.on('leaveRoom', function (_, ack) {
     const roomId = socket.data.roomId;
     const room = roomId ? rooms.get(roomId) : null;
-    if (!room) {
-      if (typeof ack === 'function') ack({ ok: true });
-      return;
-    }
+    if (!room) { if (typeof ack === 'function') ack({ ok: true }); return; }
     const role = roleForSocket(room, socket.id);
-    if (role === 'defender') {
-      room.defenderSocketId = null;
-      clearDisconnectGrace(room, 'defender');
-    }
-    if (role === 'attacker') {
-      room.attackerSocketId = null;
-      room.attackerSessionToken = '';
-      clearDisconnectGrace(room, 'attacker');
-    }
+    if (role === 'defender') { room.defenderSocketId = null; clearDisconnectGrace(room, 'defender'); }
+    if (role === 'attacker') { room.attackerSocketId = null; room.attackerSessionToken = ''; clearDisconnectGrace(room, 'attacker'); }
     resetRoomOnPlayerLeave(room);
     socket.leave(roomId);
     socket.data.roomId = null;
@@ -1288,16 +1129,13 @@ io.on('connection', function (socket) {
     if (typeof ack === 'function') ack({ ok: true });
   });
 
+  // ── disconnect ──────────────────────────────────────────────────────────────
   socket.on('disconnect', function () {
     metrics.disconnectionsTotal += 1;
     const roomId = socket.data.roomId;
     const room = roomId ? rooms.get(roomId) : null;
     socketRateState.delete(socket.id);
-    logEvent('socket_disconnected', {
-      socketId: socket.id,
-      ip: socket.data && socket.data.clientIp ? socket.data.clientIp : 'unknown',
-      roomId: roomId || ''
-    });
+    logEvent('socket_disconnected', { socketId: socket.id, roomId: roomId || '' });
     if (!room) return;
     const role = roleForSocket(room, socket.id);
     if (!role) return;
@@ -1307,50 +1145,28 @@ io.on('connection', function (socket) {
   });
 });
 
+// ─── HTTP Endpoints ───────────────────────────────────────────────────────────
 app.get('/health', function (_req, res) {
   res.json({
-    ok: true,
-    rooms: rooms.size,
+    ok: true, rooms: rooms.size,
     territoryCacheSize: territoryByName.size,
-    territoryCacheLoadedAt,
-    territoryCacheLoadError,
+    territoryCacheLoadedAt, territoryCacheLoadError,
     uptimeMs: Date.now() - metrics.startedAt,
     tokenAuthEnabled: !!ECO_WAR_SHARED_TOKEN,
     allowedOrigins: ALLOWED_ORIGINS,
-    rateLimit: {
-      windowMs: RATE_LIMIT_WINDOW_MS,
-      maxPerSocket: RATE_LIMIT_MAX_SOCKET,
-      maxPerIp: RATE_LIMIT_MAX_IP
-    },
-    roomLifecycle: {
-      disconnectGraceMs: DISCONNECT_GRACE_MS
-    },
-    metrics: {
-      connectionsTotal: metrics.connectionsTotal,
-      disconnectionsTotal: metrics.disconnectionsTotal,
-      roomCreateTotal: metrics.roomCreateTotal,
-      roomJoinTotal: metrics.roomJoinTotal,
-      roomDeleteTotal: metrics.roomDeleteTotal,
-      resumeSuccessTotal: metrics.resumeSuccessTotal,
-      resumeFailTotal: metrics.resumeFailTotal,
-      graceExpiryTotal: metrics.graceExpiryTotal,
-      rateLimitRejectTotal: metrics.rateLimitRejectTotal,
-      authRejectTotal: metrics.authRejectTotal,
-      originRejectTotal: metrics.originRejectTotal
-    }
+    rateLimit: { windowMs: RATE_LIMIT_WINDOW_MS, maxPerSocket: RATE_LIMIT_MAX_SOCKET, maxPerIp: RATE_LIMIT_MAX_IP },
+    roomLifecycle: { disconnectGraceMs: DISCONNECT_GRACE_MS },
+    metrics
   });
 });
 
+// ─── Startup ──────────────────────────────────────────────────────────────────
 loadTerritoryCache()
-  .then(function () {
-    console.log('Territory cache loaded. Entries: ' + territoryByName.size);
-  })
+  .then(function () { console.log('Territory cache loaded. Entries: ' + territoryByName.size); })
   .catch(function (e) {
     territoryCacheLoadError = e instanceof Error ? e.message : String(e);
     console.error('Territory cache startup load failed:', territoryCacheLoadError);
   })
   .finally(function () {
-    server.listen(PORT, function () {
-      console.log('Socket room server listening on port ' + PORT);
-    });
+    server.listen(PORT, function () { console.log('Socket room server listening on port ' + PORT); });
   });
