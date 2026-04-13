@@ -217,12 +217,14 @@ function createRoomState(roomId, defenderSocketId) {
     prepTimer: null,
     nextTickAt: null,
     tickCount: 0,
-    attackerWarType: null,
-    warTimeSeconds: null,
-    warStartedAt: null,
-    warTimer: null,
+    attackerWarType: 'normal',
+    // Manual attack flow
+    attackerCapturedTerritories: [], // territories the attacker has taken
+    currentAttack: null,             // { territory, phase:'queue'|'battle', endsAt, battleEndsAt, towerStats }
+    attackQueueTimer: null,
+    attackBattleTimer: null,
     warResult: null,
-    warTowerStats: null
+    warTowerStats: null              // stats from last territory battle
   };
 }
 
@@ -251,8 +253,8 @@ function publicRoomState(room) {
     nextTickAt: room.nextTickAt,
     tickCount: room.tickCount,
     attackerWarType: room.attackerWarType,
-    warTimeSeconds: room.warTimeSeconds,
-    warStartedAt: room.warStartedAt,
+    attackerCapturedTerritories: room.attackerCapturedTerritories || [],
+    currentAttack: room.currentAttack,
     warResult: room.warResult,
     warTowerStats: room.warTowerStats
   };
@@ -574,24 +576,33 @@ function moveOneHopPackets(room, selected, messages) {
 }
 
 // ─── Combat System ────────────────────────────────────────────────────────────
-function calcTowerStats(room) {
-  const hq = room.hqTerritory || (room.selectedTerritories && room.selectedTerritories[0]) || '';
-  const defaultStats = { towerHP: TOWER_BASE_HP, effectiveHP: TOWER_BASE_HP, connections: 0, healthLevel: 0, defenseLevel: 0, hq };
-  if (!hq) return defaultStats;
-  const upgrades = (room.territoryUpgrades && room.territoryUpgrades[hq]) || {};
+
+/**
+ * Calculate tower stats for ANY territory (not just HQ).
+ * Connections = adjacent defender-owned territories (boosts HP).
+ */
+function calcTerritoryTowerStats(room, territoryName) {
+  const upgrades = (room.territoryUpgrades && room.territoryUpgrades[territoryName]) || {};
   const healthLevel  = clamp(parseInt(upgrades.health  || 0, 10) || 0, 0, 11);
   const defenseLevel = clamp(parseInt(upgrades.defense || 0, 10) || 0, 0, 11);
   const selected = room.selectedTerritories || [];
   const selectedSet = new Set(selected);
-  const hqTradeRoutes = (territoryByName.get(hq) || {}).tradeRoutes || [];
-  const connections = hqTradeRoutes.filter(t => t !== hq && selectedSet.has(t)).length;
+  const tradeRoutes = (territoryByName.get(territoryName) || {}).tradeRoutes || [];
+  const connections = tradeRoutes.filter(t => t !== territoryName && selectedSet.has(t)).length;
   const healthMultiplier = 1 + (healthLevel  * 0.25);
   const connectionBonus  = 1 + (0.3 * connections);
   const towerHP = Math.floor(TOWER_BASE_HP * healthMultiplier * connectionBonus);
-  // Defense: each level = 5% damage reduction, capped at 80% (so EHP = HP / (1 - reduction))
   const defenseReduction = Math.min(0.80, defenseLevel * 0.05);
   const effectiveHP = Math.floor(towerHP / (1 - defenseReduction));
-  return { towerHP, effectiveHP, connections, healthLevel, defenseLevel, hq };
+  return { towerHP, effectiveHP, connections, healthLevel, defenseLevel, territory: territoryName };
+}
+
+// Legacy alias used by prepTick estimates (shows HQ stats)
+function calcTowerStats(room) {
+  const hq = room.hqTerritory || (room.selectedTerritories && room.selectedTerritories[0]) || '';
+  if (!hq) return { towerHP: TOWER_BASE_HP, effectiveHP: TOWER_BASE_HP, connections: 0, healthLevel: 0, defenseLevel: 0, hq };
+  const stats = calcTerritoryTowerStats(room, hq);
+  return { ...stats, hq };
 }
 
 function calcWarTime(effectiveHP, dps) {
@@ -608,6 +619,132 @@ function calcAllWarEstimates(room) {
     estimates[type] = { warTimeSeconds, dps };
   });
   return { towerStats, estimates };
+}
+
+/**
+ * Queue time (seconds) before a war battle begins.
+ *   - No adjacent capture → 120s (2 min)
+ *   - Adjacent capture exists → (hops_from_target_to_HQ + 1) × 60s
+ */
+function calcQueueTime(room, targetTerritory) {
+  const captured = new Set(room.attackerCapturedTerritories || []);
+  const targetData = territoryByName.get(targetTerritory);
+  const tradeRoutes = (targetData && targetData.tradeRoutes) || [];
+  const hasAdjCapture = tradeRoutes.some(function (t) { return captured.has(t); });
+  if (!hasAdjCapture) return 120; // 2-min base
+  // Find hops from target territory to defender HQ
+  const hq = room.hqTerritory || '';
+  const selected = room.selectedTerritories || [];
+  const adj = buildSelectedAdjacency(selected);
+  const path = findSelectedOnlyPathToHq(targetTerritory, hq, adj);
+  const hops = path ? Math.max(0, path.length - 1) : 1;
+  return (hops + 1) * 60;
+}
+
+/**
+ * Is this territory eligible to be attacked?
+ * Rules: must still be owned by defender AND either:
+ *   1. Attacker has no captures yet (can attack any territory)
+ *   2. Attacker owns an adjacent territory (captured previously)
+ */
+function isAttackable(room, targetTerritory) {
+  const defTerrStr = room.selectedTerritories || [];
+  if (!defTerrStr.includes(targetTerritory)) return false;
+  const captured = room.attackerCapturedTerritories || [];
+  if (captured.length === 0) return true; // First attack: any territory
+  const capturedSet = new Set(captured);
+  const targetData = territoryByName.get(targetTerritory);
+  const tradeRoutes = (targetData && targetData.tradeRoutes) || [];
+  return tradeRoutes.some(function (t) { return capturedSet.has(t); });
+}
+
+/**
+ * Stop any in-progress attack timers.
+ */
+function stopAttackTimers(room) {
+  if (room.attackQueueTimer)  { clearTimeout(room.attackQueueTimer);  room.attackQueueTimer  = null; }
+  if (room.attackBattleTimer) { clearTimeout(room.attackBattleTimer); room.attackBattleTimer = null; }
+}
+
+/**
+ * Start an attack on a territory:
+ *   1. Queue phase (calcQueueTime)
+ *   2. Battle phase (calcWarTime with attacker DPS)
+ *   3. Capture: remove from defender, add to attacker
+ *   4. If HQ captured: war ends
+ */
+function startAttackOnTerritory(roomId, territoryName) {
+  const room = rooms.get(roomId);
+  if (!room || room.status !== 'playing') return;
+  stopAttackTimers(room);
+
+  const queueSeconds  = calcQueueTime(room, territoryName);
+  const queueEndsAt   = Date.now() + queueSeconds * 1000;
+  const towerStats    = calcTerritoryTowerStats(room, territoryName);
+  const warType       = room.attackerWarType || 'normal';
+  const attackDef     = WAR_ATTACK_TYPES[warType] || WAR_ATTACK_TYPES.normal;
+  const battleSeconds = calcWarTime(towerStats.effectiveHP, attackDef.dps);
+  const battleEndsAt  = queueEndsAt + battleSeconds * 1000;
+
+  room.currentAttack = {
+    territory: territoryName,
+    phase: 'queue',
+    queueSeconds, queueEndsAt,
+    battleSeconds, battleEndsAt,
+    towerStats: {
+      ...towerStats,
+      warType, attackerDPS: attackDef.dps,
+      queueSeconds, battleSeconds, gracePeriod: WAR_GRACE_SECONDS
+    }
+  };
+
+  logEvent('attack_queued', { roomId, territoryName, queueSeconds, battleSeconds, warType });
+  io.to(roomId).emit('attack:queued', {
+    territory: territoryName,
+    queueSeconds, queueEndsAt,
+    battleSeconds, battleEndsAt,
+    towerStats: room.currentAttack.towerStats
+  });
+  emitRoomState(roomId);
+
+  // After queue: transition to battle phase
+  room.attackQueueTimer = setTimeout(function () {
+    const ar = rooms.get(roomId);
+    if (!ar || ar.status !== 'playing' || !ar.currentAttack || ar.currentAttack.territory !== territoryName) return;
+    ar.currentAttack.phase = 'battle';
+    logEvent('attack_battle', { roomId, territoryName, battleSeconds });
+    io.to(roomId).emit('attack:battle', {
+      territory: territoryName,
+      battleSeconds,
+      battleEndsAt: ar.currentAttack.battleEndsAt,
+      towerStats: ar.currentAttack.towerStats
+    });
+    emitRoomState(roomId);
+
+    // After battle: capture
+    ar.attackBattleTimer = setTimeout(function () {
+      const br = rooms.get(roomId);
+      if (!br || br.status !== 'playing' || !br.currentAttack || br.currentAttack.territory !== territoryName) return;
+      // Remove from defender
+      br.selectedTerritories = (br.selectedTerritories || []).filter(function (t) { return t !== territoryName; });
+      // Add to attacker
+      if (!br.attackerCapturedTerritories.includes(territoryName)) br.attackerCapturedTerritories.push(territoryName);
+      br.currentAttack = null;
+      br.warTowerStats = room.currentAttack ? room.currentAttack.towerStats : null;
+
+      logEvent('attack_captured', { roomId, territoryName });
+      io.to(roomId).emit('attack:captured', { territory: territoryName });
+
+      // Check win: HQ captured or all territories captured
+      const hq = br.hqTerritory || '';
+      if (territoryName === hq || br.selectedTerritories.length === 0) {
+        br.warResult = 'attacker_wins';
+        io.to(roomId).emit('war:ended', { result: 'attacker_wins', capturedTerritory: territoryName, warTowerStats: br.warTowerStats });
+        logEvent('war_ended', { roomId, result: 'attacker_wins' });
+      }
+      emitRoomState(roomId);
+    }, battleSeconds * 1000);
+  }, queueSeconds * 1000);
 }
 
 // ─── Eco Tick ─────────────────────────────────────────────────────────────────
@@ -687,41 +824,12 @@ function runEcoTick(roomId) {
 // ─── Timers ───────────────────────────────────────────────────────────────────
 function stopPrepTicker(room) { if (room.prepTimer) { clearInterval(room.prepTimer); room.prepTimer = null; } }
 function stopTickLoop(room) { if (room.tickTimer) { clearInterval(room.tickTimer); room.tickTimer = null; } room.nextTickAt = null; }
-function stopWarTimer(room) { if (room.warTimer) { clearTimeout(room.warTimer); room.warTimer = null; } }
 
 function startTickLoop(roomId) {
   const room = rooms.get(roomId);
   if (!room || room.tickTimer) return;
   room.nextTickAt = Date.now() + room.tickIntervalMs;
   room.tickTimer = setInterval(function () { runEcoTick(roomId); }, room.tickIntervalMs);
-}
-
-function startWarPhase(roomId) {
-  const room = rooms.get(roomId);
-  if (!room) return;
-  const warType = room.attackerWarType || 'normal';
-  const attackDef = WAR_ATTACK_TYPES[warType] || WAR_ATTACK_TYPES.normal;
-  const towerStats = calcTowerStats(room);
-  const warTimeSeconds = calcWarTime(towerStats.effectiveHP, attackDef.dps);
-  room.warTimeSeconds = warTimeSeconds;
-  room.warStartedAt   = Date.now();
-  room.warTowerStats  = {
-    hq: towerStats.hq, towerHP: towerStats.towerHP, effectiveHP: towerStats.effectiveHP,
-    connections: towerStats.connections, healthLevel: towerStats.healthLevel, defenseLevel: towerStats.defenseLevel,
-    attackerWarType: warType, attackerDPS: attackDef.dps, warTimeSeconds, gracePeriod: WAR_GRACE_SECONDS
-  };
-  io.to(roomId).emit('war:started', room.warTowerStats);
-  emitRoomState(roomId);
-  stopWarTimer(room);
-  room.warTimer = setTimeout(function () {
-    const activeRoom = rooms.get(roomId);
-    if (!activeRoom || activeRoom.status !== 'playing') return;
-    activeRoom.warResult = 'attacker_wins';
-    io.to(roomId).emit('war:ended', { result: 'attacker_wins', warTowerStats: activeRoom.warTowerStats });
-    emitRoomState(roomId);
-    logEvent('war_ended', { roomId, result: 'attacker_wins', warTimeSeconds });
-  }, warTimeSeconds * 1000);
-  logEvent('war_started', { roomId, warType, warTimeSeconds, towerHP: towerStats.towerHP, effectiveHP: towerStats.effectiveHP });
 }
 
 function startPrepCountdown(roomId) {
@@ -749,8 +857,12 @@ function startPrepCountdown(roomId) {
       activeRoom.status = 'playing';
       activeRoom.prepSecondsRemaining = 0;
       io.to(roomId).emit('statusChanged', { status: activeRoom.status });
+      // No auto-war: attacker manually selects territory to attack
+      io.to(roomId).emit('playing:started', {
+        message: 'Prep complete! Attacker: click a territory on the map to begin your assault.',
+        attackerWarType: activeRoom.attackerWarType
+      });
       emitRoomState(roomId);
-      startWarPhase(roomId);
     }
   }, 1000);
 }
@@ -765,7 +877,7 @@ function cleanupRoomIfEmpty(roomId) {
   const room = rooms.get(roomId);
   if (!room) return;
   if (!hasRolePresence(room, 'defender') && !hasRolePresence(room, 'attacker')) {
-    stopPrepTicker(room); stopTickLoop(room); stopWarTimer(room);
+    stopPrepTicker(room); stopTickLoop(room); stopAttackTimers(room);
     if (room.defenderDisconnectTimer) { clearTimeout(room.defenderDisconnectTimer); room.defenderDisconnectTimer = null; }
     if (room.attackerDisconnectTimer) { clearTimeout(room.attackerDisconnectTimer); room.attackerDisconnectTimer = null; }
     rooms.delete(roomId);
@@ -805,10 +917,11 @@ function resetRoomOnPlayerLeave(room) {
   room.defenderReady = false;
   room.attackerReady = false;
   if (room.status === 'prep' || room.status === 'playing') {
-    stopPrepTicker(room); stopTickLoop(room); stopWarTimer(room);
+    stopPrepTicker(room); stopTickLoop(room); stopAttackTimers(room);
     room.status = 'lobby';
     room.prepSecondsRemaining = null;
-    room.warTimeSeconds = null; room.warStartedAt = null;
+    room.attackerCapturedTerritories = [];
+    room.currentAttack = null;
     room.warResult = null; room.warTowerStats = null;
     io.to(room.id).emit('statusChanged', { status: room.status });
   }
@@ -1041,6 +1154,41 @@ io.on('connection', function (socket) {
     room.territoryRouteMode[territoryName] = mode;
     emitRoomState(roomId);
     if (typeof ack === 'function') ack({ ok: true, territoryName, routeMode: mode });
+  });
+
+  // ── attacker:selectWarType ──────────────────────────────────────────────────
+  // Can be changed any time before or during playing (before an attack is queued)
+  socket.on('attacker:selectWarType', function (payload, ack) {
+    if (!allowEventRate(socket, 'attacker:selectWarType')) { if (typeof ack === 'function') ack({ ok: false, error: 'Rate limited.' }); return; }
+    const roomId = socket.data.roomId;
+    const room = roomId ? rooms.get(roomId) : null;
+    if (!room) { if (typeof ack === 'function') ack({ ok: false, error: 'Not in a room.' }); return; }
+    if (roleForSocket(room, socket.id) !== 'attacker') { if (typeof ack === 'function') ack({ ok: false, error: 'Attacker only.' }); return; }
+    if (room.status === 'playing' && room.currentAttack) { if (typeof ack === 'function') ack({ ok: false, error: 'Cannot change war type while attack is in progress.' }); return; }
+    const warType = payload && WAR_ATTACK_TYPES[payload.warType] ? payload.warType : 'normal';
+    room.attackerWarType = warType;
+    const { towerStats, estimates } = calcAllWarEstimates(room);
+    io.to(roomId).emit('war:estimates', { warType, towerStats, estimates });
+    emitRoomState(roomId);
+    if (typeof ack === 'function') ack({ ok: true, warType, estimates });
+  });
+
+  // ── attacker:attack ─────────────────────────────────────────────────────────
+  socket.on('attacker:attack', function (payload, ack) {
+    if (!allowEventRate(socket, 'attacker:attack')) { if (typeof ack === 'function') ack({ ok: false, error: 'Rate limited.' }); return; }
+    const roomId = socket.data.roomId;
+    const room = roomId ? rooms.get(roomId) : null;
+    if (!room) { if (typeof ack === 'function') ack({ ok: false, error: 'Not in a room.' }); return; }
+    if (roleForSocket(room, socket.id) !== 'attacker') { if (typeof ack === 'function') ack({ ok: false, error: 'Attacker only.' }); return; }
+    if (room.status !== 'playing') { if (typeof ack === 'function') ack({ ok: false, error: 'Playing phase only.' }); return; }
+    if (room.currentAttack) { if (typeof ack === 'function') ack({ ok: false, error: 'An attack is already in progress.' }); return; }
+    const territoryName = payload && typeof payload.territoryName === 'string' ? payload.territoryName.trim() : '';
+    if (!territoryName) { if (typeof ack === 'function') ack({ ok: false, error: 'territoryName required.' }); return; }
+    if (!isAttackable(room, territoryName)) {
+      if (typeof ack === 'function') ack({ ok: false, error: 'Territory is not attackable. Must be a defender territory adjacent to a captured territory (or first attack).' }); return;
+    }
+    startAttackOnTerritory(roomId, territoryName);
+    if (typeof ack === 'function') ack({ ok: true, territory: territoryName });
   });
 
   // ── setHqTerritory ──────────────────────────────────────────────────────────
