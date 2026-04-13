@@ -18,62 +18,78 @@ const TERRITORIES_URL = 'https://raw.githubusercontent.com/jakematt123/Wynncraft
 
 // ─── Game Constants (Real Wynncraft Values) ───────────────────────────────────
 /**
- * All 4 tower stat upgrades (Damage/AttackSpeed/Health/Defense) share the
- * SAME hourly drain cost table in Wynncraft. Index = level.
+ * Tower upgrades: same hourly drain table for all 4 stat categories. Index = level.
  */
 const UPGRADE_COSTS_PER_LEVEL = [0, 100, 300, 600, 1200, 2400, 4800, 8400, 12000, 15600, 19200, 22800];
 
-const UPGRADE_COSTS = {
-  damage: UPGRADE_COSTS_PER_LEVEL,
-  attackSpeed: UPGRADE_COSTS_PER_LEVEL,
-  health: UPGRADE_COSTS_PER_LEVEL,
-  defense: UPGRADE_COSTS_PER_LEVEL
-};
+// Storage upgrades are ONE-TIME purchases (not hourly drain).
+// Larger Emerald Storage → costs Wood per level
+const EMERALD_STORAGE_COSTS_WOOD = [0, 100, 220, 400, 650, 950, 1350, 1850, 2500, 3300, 4300, 5500];
+// Larger Resource Storage → costs Emeralds per level
+const RESOURCE_STORAGE_COSTS_EM  = [0, 300, 650, 1100, 1700, 2500, 3500, 4700, 6200, 8000, 10100, 12500];
 
-// Storage upgrade one-time cost: [emeralds, wood] per level (index = next level)
-const STORAGE_UPGRADE_COSTS = [
-  [0, 0], [300, 100], [650, 220], [1100, 400], [1700, 650],
-  [2500, 950], [3500, 1350], [4700, 1850], [6200, 2500],
-  [8000, 3300], [10100, 4300], [12500, 5500]
-];
-
-// Bonus system: hourly drain per level, resource key
+/**
+ * BONUS_DEFS — official Wynncraft bonus upgrades with correct resource costs.
+ * Tower bonuses:  strongerMobs, multiAttack, aura, volley
+ * Economy bonuses: efficientEmeralds (+%em/tick, costs Crops),
+ *                  efficientResources (+%res/tick, costs Emeralds),
+ *                  emeraldRate (faster em tick, costs Ore),
+ *                  resourceRate (faster res tick, costs Emeralds)
+ */
 const BONUS_DEFS = {
+  // ── Tower bonuses ──
   strongerMobs:       { resource: 'wood',     costs: [0, 1200, 2400, 4800], maxLevel: 3 },
   multiAttack:        { resource: 'fish',     costs: [0, 3200],             maxLevel: 1 },
   aura:               { resource: 'crops',    costs: [0, 2000],             maxLevel: 1 },
   volley:             { resource: 'ore',      costs: [0, 2000],             maxLevel: 1 },
-  resourceProduction: { resource: 'ore',      costs: [0, 800, 1600, 3200],  maxLevel: 3 },
-  emeraldProduction:  { resource: 'emeralds', costs: [0, 1000, 2000, 4000], maxLevel: 3 }
+  // ── Economy bonuses ──
+  efficientEmeralds:  { resource: 'crops',    costs: [0, 800,  1600, 3200], maxLevel: 3 },
+  efficientResources: { resource: 'emeralds', costs: [0, 800,  1600, 3200], maxLevel: 3 },
+  emeraldRate:        { resource: 'ore',      costs: [0, 1000, 2000, 4000], maxLevel: 3 },
+  resourceRate:       { resource: 'emeralds', costs: [0, 1000, 2000, 4000], maxLevel: 3 },
 };
 
-const UPGRADE_CATEGORIES = ['damage', 'attackSpeed', 'health', 'defense', 'storage'];
+// Tower upgrade categories and their hourly drain resources
+const UPGRADE_CATEGORIES = ['damage', 'attackSpeed', 'health', 'defense'];
 const UPGRADE_RESOURCE_BY_CATEGORY = {
-  damage: 'ore', attackSpeed: 'crops', health: 'wood', defense: 'fish', storage: 'wood'
+  damage: 'ore', attackSpeed: 'crops', health: 'wood', defense: 'fish'
+};
+// Storage upgrade categories — separate from tower upgrades, charged one-time not hourly
+const STORAGE_CATEGORIES = ['largerEmeraldStorage', 'largerResourceStorage'];
+const STORAGE_RESOURCE_BY_CATEGORY = {
+  largerEmeraldStorage: 'wood',
+  largerResourceStorage: 'emeralds'
+};
+const STORAGE_COSTS_BY_CATEGORY = {
+  largerEmeraldStorage:  EMERALD_STORAGE_COSTS_WOOD,
+  largerResourceStorage: RESOURCE_STORAGE_COSTS_EM
 };
 const RESOURCE_KEYS = ['emeralds', 'wood', 'ore', 'crops', 'fish'];
 
-// HQ storage: real Wynncraft values (1,500 → 120,000 resources; 5,000 → 400,000 emeralds)
+// HQ storage caps (same as live Wynncraft)
 const HQ_BASE_STORAGE_RESOURCE = 1500;
 const HQ_BASE_STORAGE_EMERALDS = 5000;
 const HQ_MAX_STORAGE_RESOURCE  = 120000;
 const HQ_MAX_STORAGE_EMERALDS  = 400000;
 
-// Treasury: +5% per full hour held, capped at +100%
-const TREASURY_BONUS_PER_HOUR = 0.05;
-const TREASURY_BONUS_MAX      = 1.0;
+// Treasury bonus — TIERED (not linear): +0% <1hr, +10% >=1hr, +20% >=24hr, +25% >=5 days
+const TREASURY_TIER_MS    = [3600000, 86400000, 432000000]; // 1hr, 24hr, 5 days
+const TREASURY_TIER_BONUS = [0.10,    0.20,     0.25];      // corresponding bonus values
 
-// Production bonus per level of resourceProduction / emeraldProduction bonus
-const RESOURCE_PROD_BONUS_PER_LEVEL = 0.10;
-const EMERALD_PROD_BONUS_PER_LEVEL  = 0.10;
+// Production bonus per economy bonus level (applied multiplicatively)
+const EFFICIENT_EM_PER_LEVEL  = 0.10; // +10% emerald output per efficientEmeralds level
+const EFFICIENT_RES_PER_LEVEL = 0.10; // +10% resource output per efficientResources level
+const EM_RATE_PER_LEVEL       = 0.10; // +10% emerald tick rate per emeraldRate level
+const RES_RATE_PER_LEVEL      = 0.10; // +10% resource tick rate per resourceRate level
 
 // Combat
-const TOWER_BASE_HP      = 1000000; // base HP at level 0, no connections
-const WAR_GRACE_SECONDS  = 30;
-const WAR_ATTACK_TYPES   = {
-  solo:   { label: 'Solo Warrer',      dps: 150000   },
-  normal: { label: 'Normal War Team',  dps: 2000000  },
-  elite:  { label: 'Elite War Team',   dps: 4000000  }
+const TOWER_BASE_HP    = 1000000; // base HP at level 0, no connections
+const TOWER_BASE_DPS   = 500000;  // base tower DPS at level 0, no connections
+const WAR_GRACE_SECONDS = 30;
+const WAR_ATTACK_TYPES  = {
+  solo:   { label: 'Solo Warrer',      dps: 150000  },
+  normal: { label: 'Normal War Team',  dps: 2000000 },
+  elite:  { label: 'Elite War Team',   dps: 4000000 }
 };
 const PRODUCTION_MULT_MIN = 0.5;
 const PRODUCTION_MULT_MAX = 1.5;
@@ -181,7 +197,10 @@ let territoryCacheLoadError = '';
 function createResources() { return { emeralds: 0, wood: 0, ore: 0, crops: 0, fish: 0 }; }
 function clamp(value, min, max) { return Math.max(min, Math.min(max, value)); }
 function createTerritoryBonuses() {
-  return { strongerMobs: 0, multiAttack: 0, aura: 0, volley: 0, resourceProduction: 0, emeraldProduction: 0 };
+  return {
+    strongerMobs: 0, multiAttack: 0, aura: 0, volley: 0,
+    efficientEmeralds: 0, efficientResources: 0, emeraldRate: 0, resourceRate: 0
+  };
 }
 
 // ─── Room State ───────────────────────────────────────────────────────────────
@@ -391,24 +410,28 @@ function ensurePerTerritoryStorage(room, territoryName) {
 }
 
 /**
- * HQ storage capacity at a given storage level.
+ * HQ storage capacity.
+ * - Emerald cap depends on largerEmeraldStorage level
+ * - Resource cap depends on largerResourceStorage level
  * Non-HQ territories have unlimited pass-through storage (Infinity).
  */
-function hqStorageCapacity(storageLevel, resourceKey) {
-  const level = clamp(storageLevel, 0, 11);
-  if (resourceKey === 'emeralds') {
-    return Math.floor(HQ_BASE_STORAGE_EMERALDS + (level / 11) * (HQ_MAX_STORAGE_EMERALDS - HQ_BASE_STORAGE_EMERALDS));
-  }
-  return Math.floor(HQ_BASE_STORAGE_RESOURCE + (level / 11) * (HQ_MAX_STORAGE_RESOURCE - HQ_BASE_STORAGE_RESOURCE));
+function hqEmeraldStorageCap(emeraldStorLevel) {
+  const lv = clamp(emeraldStorLevel, 0, 11);
+  return Math.floor(HQ_BASE_STORAGE_EMERALDS + (lv / 11) * (HQ_MAX_STORAGE_EMERALDS - HQ_BASE_STORAGE_EMERALDS));
+}
+function hqResourceStorageCap(resourceStorLevel) {
+  const lv = clamp(resourceStorLevel, 0, 11);
+  return Math.floor(HQ_BASE_STORAGE_RESOURCE + (lv / 11) * (HQ_MAX_STORAGE_RESOURCE - HQ_BASE_STORAGE_RESOURCE));
 }
 
-function getStorageLevel(room, territoryName) {
+function getUpgradeLevel(room, territoryName, field) {
   const row = room.territoryUpgrades && room.territoryUpgrades[territoryName];
-  return clamp(parseInt((row && row.storage) || 0, 10) || 0, 0, 11);
+  return clamp(parseInt((row && row[field]) || 0, 10) || 0, 0, 11);
 }
 
 /**
  * Apply storage caps — ONLY to HQ territory.
+ * Emerald cap from largerEmeraldStorage level; resource cap from largerResourceStorage level.
  * Non-HQ territories are unlimited pass-through (real Wynncraft behavior).
  */
 function applyHqStorageCap(room, messages) {
@@ -416,10 +439,13 @@ function applyHqStorageCap(room, messages) {
   if (!hq) return;
   const store = room.perTerritoryStorage[hq];
   if (!store) return;
-  const storageLevel = getStorageLevel(room, hq);
+  const emStorLv  = getUpgradeLevel(room, hq, 'largerEmeraldStorage');
+  const resStorLv = getUpgradeLevel(room, hq, 'largerResourceStorage');
+  const emCap  = hqEmeraldStorageCap(emStorLv);
+  const resCap = hqResourceStorageCap(resStorLv);
   for (let r = 0; r < RESOURCE_KEYS.length; r++) {
     const key = RESOURCE_KEYS[r];
-    const cap = hqStorageCapacity(storageLevel, key);
+    const cap = key === 'emeralds' ? emCap : resCap;
     if (store[key] > cap) {
       const overflow = Math.floor(store[key] - cap);
       store[key] = cap;
@@ -428,12 +454,16 @@ function applyHqStorageCap(room, messages) {
   }
 }
 
-// ─── Treasury Bonus ───────────────────────────────────────────────────────────
+// ─── Treasury Bonus (tiered) ──────────────────────────────────────────────────
 function getTreasuryBonus(room, territoryName) {
   const heldSince = room.territoryHeldSince && room.territoryHeldSince[territoryName];
   if (!heldSince) return 0;
-  const hoursHeld = (Date.now() - heldSince) / 3600000;
-  return Math.min(TREASURY_BONUS_MAX, Math.floor(hoursHeld) * TREASURY_BONUS_PER_HOUR);
+  const ms = Date.now() - heldSince;
+  // Walk tiers from highest to lowest
+  for (let i = TREASURY_TIER_MS.length - 1; i >= 0; i--) {
+    if (ms >= TREASURY_TIER_MS[i]) return TREASURY_TIER_BONUS[i];
+  }
+  return 0; // < 1 hour
 }
 
 // ─── Upgrade Shape Normalisation ─────────────────────────────────────────────
@@ -441,14 +471,25 @@ function normalizeUpgradeLevel(value) { return clamp(parseInt(value || 0, 10) ||
 
 function ensureTerritoryUpgradeShape(room, territoryName) {
   if (!room.territoryUpgrades[territoryName]) {
-    room.territoryUpgrades[territoryName] = { damage: 0, attackSpeed: 0, health: 0, defense: 0, storage: 0 };
+    room.territoryUpgrades[territoryName] = {
+      damage: 0, attackSpeed: 0, health: 0, defense: 0,
+      largerEmeraldStorage: 0, largerResourceStorage: 0
+    };
   } else {
     const row = room.territoryUpgrades[territoryName];
-    row.damage = normalizeUpgradeLevel(row.damage);
+    row.damage  = normalizeUpgradeLevel(row.damage);
     row.attackSpeed = normalizeUpgradeLevel(row.attackSpeed);
-    row.health = normalizeUpgradeLevel(row.health);
+    row.health  = normalizeUpgradeLevel(row.health);
     row.defense = normalizeUpgradeLevel(row.defense);
-    row.storage = normalizeUpgradeLevel(row.storage);
+    // Migrate old single 'storage' field → split into two
+    if (row.storage != null) {
+      row.largerEmeraldStorage  = normalizeUpgradeLevel(row.largerEmeraldStorage || row.storage);
+      row.largerResourceStorage = normalizeUpgradeLevel(row.largerResourceStorage || row.storage);
+      delete row.storage;
+    } else {
+      row.largerEmeraldStorage  = normalizeUpgradeLevel(row.largerEmeraldStorage);
+      row.largerResourceStorage = normalizeUpgradeLevel(row.largerResourceStorage);
+    }
   }
   return room.territoryUpgrades[territoryName];
 }
@@ -578,23 +619,28 @@ function moveOneHopPackets(room, selected, messages) {
 // ─── Combat System ────────────────────────────────────────────────────────────
 
 /**
- * Calculate tower stats for ANY territory (not just HQ).
- * Connections = adjacent defender-owned territories (boosts HP).
+ * Calculate tower stats for ANY territory.
+ * Connection bonus (+30% per adjacent defender territory) applies to BOTH HP and DPS.
  */
 function calcTerritoryTowerStats(room, territoryName) {
   const upgrades = (room.territoryUpgrades && room.territoryUpgrades[territoryName]) || {};
   const healthLevel  = clamp(parseInt(upgrades.health  || 0, 10) || 0, 0, 11);
   const defenseLevel = clamp(parseInt(upgrades.defense || 0, 10) || 0, 0, 11);
+  const damageLevel  = clamp(parseInt(upgrades.damage  || 0, 10) || 0, 0, 11);
   const selected = room.selectedTerritories || [];
   const selectedSet = new Set(selected);
   const tradeRoutes = (territoryByName.get(territoryName) || {}).tradeRoutes || [];
-  const connections = tradeRoutes.filter(t => t !== territoryName && selectedSet.has(t)).length;
-  const healthMultiplier = 1 + (healthLevel  * 0.25);
-  const connectionBonus  = 1 + (0.3 * connections);
-  const towerHP = Math.floor(TOWER_BASE_HP * healthMultiplier * connectionBonus);
+  const connections = tradeRoutes.filter(function (t) { return t !== territoryName && selectedSet.has(t); }).length;
+  const connectionBonus  = 1 + (0.3 * connections);   // +30% per connection
+  // HP: base × health upgrade × connection bonus
+  const healthMultiplier = 1 + (healthLevel * 0.25);  // +25% per health level
+  const towerHP     = Math.floor(TOWER_BASE_HP * healthMultiplier * connectionBonus);
   const defenseReduction = Math.min(0.80, defenseLevel * 0.05);
   const effectiveHP = Math.floor(towerHP / (1 - defenseReduction));
-  return { towerHP, effectiveHP, connections, healthLevel, defenseLevel, territory: territoryName };
+  // DPS: base × damage upgrade × connection bonus (same +30% per connection)
+  const damageMultiplier = 1 + (damageLevel * 0.25);  // +25% per damage level
+  const towerDPS    = Math.floor(TOWER_BASE_DPS * damageMultiplier * connectionBonus);
+  return { towerHP, effectiveHP, towerDPS, connections, healthLevel, defenseLevel, damageLevel, territory: territoryName };
 }
 
 // Legacy alias used by prepTick estimates (shows HQ stats)
@@ -781,10 +827,13 @@ function runEcoTick(roomId) {
     const localStore = ensurePerTerritoryStorage(room, name);
     const bonuses = ensureTerritoryBonusShape(room, name);
     const treasuryBonus = getTreasuryBonus(room, name);
-    const resProdBonus = bonuses.resourceProduction * RESOURCE_PROD_BONUS_PER_LEVEL;
-    const emProdBonus  = bonuses.emeraldProduction  * EMERALD_PROD_BONUS_PER_LEVEL;
-    const resMult = 1 + treasuryBonus + resProdBonus;
+    // Efficient bonuses: +% per level; Rate bonuses: additional +% (same effect in tick model)
+    const emProdBonus  = bonuses.efficientEmeralds  * EFFICIENT_EM_PER_LEVEL
+                       + bonuses.emeraldRate        * EM_RATE_PER_LEVEL;
+    const resProdBonus = bonuses.efficientResources * EFFICIENT_RES_PER_LEVEL
+                       + bonuses.resourceRate       * RES_RATE_PER_LEVEL;
     const emMult  = 1 + treasuryBonus + emProdBonus;
+    const resMult = 1 + treasuryBonus + resProdBonus;
     localStore.emeralds += Math.floor(territory.resources.emeralds * emMult);
     localStore.wood     += Math.floor(territory.resources.wood     * resMult);
     localStore.ore      += Math.floor(territory.resources.ore      * resMult);
@@ -936,9 +985,33 @@ function applyUpgrade(room, territoryName, category) {
   if (currentLevel >= 11) return { ok: false, error: category + ' is already at max level.' };
   const nextLevel = currentLevel + 1;
   upgrades[category] = nextLevel;
-  const hourlyCost = category === 'storage' ? 0 : (UPGRADE_COSTS_PER_LEVEL[nextLevel] || 0);
-  return { ok: true, territoryName, category, level: nextLevel, resourceKey, hourlyCost };
+  return { ok: true, territoryName, category, level: nextLevel, resourceKey, hourlyCost: UPGRADE_COSTS_PER_LEVEL[nextLevel] || 0 };
 }
+
+/**
+ * Apply a one-time storage upgrade (Emerald Storage or Resource Storage).
+ * Immediately deducts cost from the HQ storage, then raises the level cap.
+ */
+function applyStorageUpgrade(room, territoryName, category) {
+  if (!STORAGE_CATEGORIES.includes(category)) return { ok: false, error: 'Invalid storage category.' };
+  const upgrades = ensureTerritoryUpgradeShape(room, territoryName);
+  const currentLevel = normalizeUpgradeLevel(upgrades[category]);
+  if (currentLevel >= 11) return { ok: false, error: category + ' already at max.' };
+  const nextLevel = currentLevel + 1;
+  const resourceKey = STORAGE_RESOURCE_BY_CATEGORY[category];
+  const cost = STORAGE_COSTS_BY_CATEGORY[category][nextLevel] || 0;
+  // Deduct cost from HQ storage
+  const hq = room.hqTerritory || '';
+  const hqStore = hq ? room.perTerritoryStorage[hq] : null;
+  if (cost > 0) {
+    const available = Number((hqStore && hqStore[resourceKey]) || 0);
+    if (available < cost) return { ok: false, error: 'Not enough ' + resourceKey + ' in HQ. Need ' + cost + ', have ' + Math.floor(available) + '.' };
+    hqStore[resourceKey] = available - cost;
+  }
+  upgrades[category] = nextLevel;
+  return { ok: true, territoryName, category, level: nextLevel, resourceKey, cost };
+}
+
 function applyBonus(room, territoryName, bonusKey) {
   const def = BONUS_DEFS[bonusKey];
   if (!def) return { ok: false, error: 'Invalid bonus.' };
@@ -1113,6 +1186,27 @@ io.on('connection', function (socket) {
     const result = applyBonus(room, territoryName, bonusKey);
     if (!result.ok) { if (typeof ack === 'function') ack(result); return; }
     io.to(roomId).emit('bonus:applied', result);
+    emitRoomState(roomId);
+    if (typeof ack === 'function') ack({ ok: true, ...result });
+  });
+
+  // ── storage:apply ────────────────────────────────────────────────────────────
+  socket.on('storage:apply', function (payload, ack) {
+    if (!requirePrivilegedAccess(socket, ack, 'storage:apply')) return;
+    if (!allowEventRate(socket, 'storage:apply')) { if (typeof ack === 'function') ack({ ok: false, error: 'Rate limited.' }); return; }
+    const roomId = socket.data.roomId;
+    const room = roomId ? rooms.get(roomId) : null;
+    if (!room) { if (typeof ack === 'function') ack({ ok: false, error: 'Not in a room.' }); return; }
+    if (room.status !== 'playing' && room.status !== 'prep') { if (typeof ack === 'function') ack({ ok: false, error: 'Prep/playing only.' }); return; }
+    if (roleForSocket(room, socket.id) !== 'defender') { if (typeof ack === 'function') ack({ ok: false, error: 'Defender only.' }); return; }
+    const territoryName = payload && typeof payload.territoryName === 'string' ? payload.territoryName.trim() : '';
+    const category      = payload && typeof payload.category === 'string' ? payload.category.trim() : '';
+    if (!territoryName || room.selectedTerritories.indexOf(territoryName) === -1) {
+      if (typeof ack === 'function') ack({ ok: false, error: 'Territory not in room.' }); return;
+    }
+    const result = applyStorageUpgrade(room, territoryName, category);
+    if (!result.ok) { if (typeof ack === 'function') ack(result); return; }
+    io.to(roomId).emit('storage:applied', result);
     emitRoomState(roomId);
     if (typeof ack === 'function') ack({ ok: true, ...result });
   });
