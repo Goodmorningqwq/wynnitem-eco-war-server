@@ -532,6 +532,24 @@ function applyUpgradeDrain(room, territoryNames, messages) {
         inactive.push(category[0].toUpperCase() + level);
       }
     }
+    // Storage upgrades — hourly drain (largerEmeraldStorage costs wood, largerResourceStorage costs emeralds)
+    for (let s = 0; s < STORAGE_CATEGORIES.length; s++) {
+      const category = STORAGE_CATEGORIES[s];
+      const level = clamp(parseInt(upgrades[category] || 0, 10) || 0, 0, 11);
+      if (!level) continue;
+      const resourceKey = STORAGE_RESOURCE_BY_CATEGORY[category];
+      const hourlyCost = STORAGE_COSTS_BY_CATEGORY[category][level] || 0;
+      const perTickCost = hourlyCost * tickHours;
+      const current = Number(storage[resourceKey] || 0);
+      if (perTickCost <= 0) { active.push(category.slice(0, 4) + level); continue; }
+      if (current >= perTickCost) {
+        storage[resourceKey] = current - perTickCost;
+        active.push(category.slice(0, 4) + level);
+      } else {
+        storage[resourceKey] = 0;
+        inactive.push(category.slice(0, 4) + level);
+      }
+    }
     let line = name;
     if (active.length) line += ' ✓(' + active.join(',') + ')';
     if (inactive.length) line += ' ✗INACTIVE(' + inactive.join(',') + ')';
@@ -998,18 +1016,11 @@ function applyStorageUpgrade(room, territoryName, category) {
   const currentLevel = normalizeUpgradeLevel(upgrades[category]);
   if (currentLevel >= 11) return { ok: false, error: category + ' already at max.' };
   const nextLevel = currentLevel + 1;
-  const resourceKey = STORAGE_RESOURCE_BY_CATEGORY[category];
-  const cost = STORAGE_COSTS_BY_CATEGORY[category][nextLevel] || 0;
-  // Deduct cost from HQ storage
-  const hq = room.hqTerritory || '';
-  const hqStore = hq ? room.perTerritoryStorage[hq] : null;
-  if (cost > 0) {
-    const available = Number((hqStore && hqStore[resourceKey]) || 0);
-    if (available < cost) return { ok: false, error: 'Not enough ' + resourceKey + ' in HQ. Need ' + cost + ', have ' + Math.floor(available) + '.' };
-    hqStore[resourceKey] = available - cost;
-  }
   upgrades[category] = nextLevel;
-  return { ok: true, territoryName, category, level: nextLevel, resourceKey, cost };
+  const resourceKey = STORAGE_RESOURCE_BY_CATEGORY[category];
+  // Storage upgrades now drain hourly (same as tower upgrades), no one-time cost
+  return { ok: true, territoryName, category, level: nextLevel, resourceKey,
+           hourlyCost: STORAGE_COSTS_BY_CATEGORY[category][nextLevel] || 0 };
 }
 
 function applyBonus(room, territoryName, bonusKey) {
@@ -1021,6 +1032,26 @@ function applyBonus(room, territoryName, bonusKey) {
   const nextLevel = currentLevel + 1;
   bonuses[bonusKey] = nextLevel;
   return { ok: true, territoryName, bonusKey, level: nextLevel, resource: def.resource, hourlyCost: def.costs[nextLevel] || 0 };
+}
+
+function applyDowngradeUpgrade(room, territoryName, category) {
+  const validCategories = UPGRADE_CATEGORIES.concat(STORAGE_CATEGORIES);
+  if (!validCategories.includes(category)) return { ok: false, error: 'Invalid upgrade category.' };
+  const upgrades = ensureTerritoryUpgradeShape(room, territoryName);
+  const currentLevel = normalizeUpgradeLevel(upgrades[category]);
+  if (currentLevel <= 0) return { ok: false, error: category + ' is already at level 0.' };
+  upgrades[category] = currentLevel - 1;
+  return { ok: true, territoryName, category, level: currentLevel - 1 };
+}
+
+function applyDowngradeBonus(room, territoryName, bonusKey) {
+  const def = BONUS_DEFS[bonusKey];
+  if (!def) return { ok: false, error: 'Invalid bonus.' };
+  const bonuses = ensureTerritoryBonusShape(room, territoryName);
+  const currentLevel = clamp(parseInt(bonuses[bonusKey] || 0, 10) || 0, 0, def.maxLevel);
+  if (currentLevel <= 0) return { ok: false, error: bonusKey + ' is already at level 0.' };
+  bonuses[bonusKey] = currentLevel - 1;
+  return { ok: true, territoryName, bonusKey, level: currentLevel - 1 };
 }
 
 // ─── Socket Events ────────────────────────────────────────────────────────────
@@ -1207,6 +1238,48 @@ io.on('connection', function (socket) {
     const result = applyStorageUpgrade(room, territoryName, category);
     if (!result.ok) { if (typeof ack === 'function') ack(result); return; }
     io.to(roomId).emit('storage:applied', result);
+    emitRoomState(roomId);
+    if (typeof ack === 'function') ack({ ok: true, ...result });
+  });
+
+  // ── upgrade:downgrade ────────────────────────────────────────────────────────
+  socket.on('upgrade:downgrade', function (payload, ack) {
+    if (!requirePrivilegedAccess(socket, ack, 'upgrade:downgrade')) return;
+    if (!allowEventRate(socket, 'upgrade:downgrade')) { if (typeof ack === 'function') ack({ ok: false, error: 'Rate limited.' }); return; }
+    const roomId = socket.data.roomId;
+    const room = roomId ? rooms.get(roomId) : null;
+    if (!room) { if (typeof ack === 'function') ack({ ok: false, error: 'Not in a room.' }); return; }
+    if (room.status !== 'playing' && room.status !== 'prep') { if (typeof ack === 'function') ack({ ok: false, error: 'Prep/playing only.' }); return; }
+    if (roleForSocket(room, socket.id) !== 'defender') { if (typeof ack === 'function') ack({ ok: false, error: 'Defender only.' }); return; }
+    const territoryName = payload && typeof payload.territoryName === 'string' ? payload.territoryName.trim() : '';
+    const category     = payload && typeof payload.category === 'string' ? payload.category.trim() : '';
+    if (!territoryName || room.selectedTerritories.indexOf(territoryName) === -1) {
+      if (typeof ack === 'function') ack({ ok: false, error: 'Territory not in room.' }); return;
+    }
+    const result = applyDowngradeUpgrade(room, territoryName, category);
+    if (!result.ok) { if (typeof ack === 'function') ack(result); return; }
+    io.to(roomId).emit('upgrade:applied', result);
+    emitRoomState(roomId);
+    if (typeof ack === 'function') ack({ ok: true, ...result });
+  });
+
+  // ── bonus:downgrade ──────────────────────────────────────────────────────────
+  socket.on('bonus:downgrade', function (payload, ack) {
+    if (!requirePrivilegedAccess(socket, ack, 'bonus:downgrade')) return;
+    if (!allowEventRate(socket, 'bonus:downgrade')) { if (typeof ack === 'function') ack({ ok: false, error: 'Rate limited.' }); return; }
+    const roomId = socket.data.roomId;
+    const room = roomId ? rooms.get(roomId) : null;
+    if (!room) { if (typeof ack === 'function') ack({ ok: false, error: 'Not in a room.' }); return; }
+    if (room.status !== 'playing' && room.status !== 'prep') { if (typeof ack === 'function') ack({ ok: false, error: 'Prep/playing only.' }); return; }
+    if (roleForSocket(room, socket.id) !== 'defender') { if (typeof ack === 'function') ack({ ok: false, error: 'Defender only.' }); return; }
+    const territoryName = payload && typeof payload.territoryName === 'string' ? payload.territoryName.trim() : '';
+    const bonusKey      = payload && typeof payload.bonusKey === 'string' ? payload.bonusKey.trim() : '';
+    if (!territoryName || room.selectedTerritories.indexOf(territoryName) === -1) {
+      if (typeof ack === 'function') ack({ ok: false, error: 'Territory not in room.' }); return;
+    }
+    const result = applyDowngradeBonus(room, territoryName, bonusKey);
+    if (!result.ok) { if (typeof ack === 'function') ack(result); return; }
+    io.to(roomId).emit('bonus:applied', result);
     emitRoomState(roomId);
     if (typeof ack === 'function') ack({ ok: true, ...result });
   });
