@@ -275,7 +275,8 @@ function publicRoomState(room) {
     attackerCapturedTerritories: room.attackerCapturedTerritories || [],
     currentAttack: room.currentAttack,
     warResult: room.warResult,
-    warTowerStats: room.warTowerStats
+    warTowerStats: room.warTowerStats,
+    inactiveUpgradesSnapshot: room.inactiveUpgradesSnapshot || {}
   };
 }
 
@@ -509,11 +510,13 @@ function ensureTerritoryBonusShape(room, territoryName) {
 // ─── Upgrade/Bonus Drain ──────────────────────────────────────────────────────
 function applyUpgradeDrain(room, territoryNames, messages) {
   const tickHours = room.tickIntervalMs / 3600000;
+  if (!room.inactiveUpgradesSnapshot) room.inactiveUpgradesSnapshot = {};
   for (let i = 0; i < territoryNames.length; i++) {
     const name = territoryNames[i];
     const upgrades = ensureTerritoryUpgradeShape(room, name);
     const storage = ensurePerTerritoryStorage(room, name);
     const active = [], inactive = [];
+    room.inactiveUpgradesSnapshot[name] = []; // reset per tick
     for (let c = 0; c < UPGRADE_CATEGORIES.length; c++) {
       const category = UPGRADE_CATEGORIES[c];
       if (category === 'storage') continue;
@@ -530,6 +533,7 @@ function applyUpgradeDrain(room, territoryNames, messages) {
       } else {
         storage[resourceKey] = 0;
         inactive.push(category[0].toUpperCase() + level);
+        room.inactiveUpgradesSnapshot[name].push(category);
       }
     }
     // Storage upgrades — hourly drain (largerEmeraldStorage costs wood, largerResourceStorage costs emeralds)
@@ -548,6 +552,7 @@ function applyUpgradeDrain(room, territoryNames, messages) {
       } else {
         storage[resourceKey] = 0;
         inactive.push(category.slice(0, 4) + level);
+        room.inactiveUpgradesSnapshot[name].push(category);
       }
     }
     let line = name;
