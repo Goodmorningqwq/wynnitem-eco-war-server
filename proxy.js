@@ -843,6 +843,8 @@ function runEcoTick(roomId) {
   for (let i = 0; i < selected.length; i++) { ensurePerTerritoryStorage(room, selected[i]); }
 
   // 1. Produce resources per territory (with treasury + production bonuses)
+  // territory.resources values are HOURLY rates — scale by the tick fraction of an hour.
+  const tickHours = room.tickIntervalMs / 3600000;
   for (let i = 0; i < selected.length; i++) {
     const name = selected[i];
     const territory = territoryByName.get(name);
@@ -857,11 +859,11 @@ function runEcoTick(roomId) {
                        + bonuses.resourceRate       * RES_RATE_PER_LEVEL;
     const emMult  = 1 + treasuryBonus + emProdBonus;
     const resMult = 1 + treasuryBonus + resProdBonus;
-    localStore.emeralds += Math.floor(territory.resources.emeralds * emMult);
-    localStore.wood     += Math.floor(territory.resources.wood     * resMult);
-    localStore.ore      += Math.floor(territory.resources.ore      * resMult);
-    localStore.crops    += Math.floor(territory.resources.crops    * resMult);
-    localStore.fish     += Math.floor(territory.resources.fish     * resMult);
+    localStore.emeralds += Math.floor(territory.resources.emeralds * emMult * tickHours);
+    localStore.wood     += Math.floor(territory.resources.wood     * resMult * tickHours);
+    localStore.ore      += Math.floor(territory.resources.ore      * resMult * tickHours);
+    localStore.crops    += Math.floor(territory.resources.crops    * resMult * tickHours);
+    localStore.fish     += Math.floor(territory.resources.fish     * resMult * tickHours);
   }
 
   // 2. Move resources one hop toward HQ (no tax — all defender's own territories)
@@ -912,7 +914,7 @@ function startPrepCountdown(roomId) {
   room.prepSecondsRemaining = PREP_SECONDS;
   io.to(roomId).emit('statusChanged', { status: room.status });
   emitRoomState(roomId);
-  startTickLoop(roomId);
+  // Do NOT start the eco tick loop during prep — resources only accumulate during playing.
   room.prepTimer = setInterval(function () {
     const activeRoom = rooms.get(roomId);
     if (!activeRoom) return;
@@ -929,6 +931,8 @@ function startPrepCountdown(roomId) {
       activeRoom.status = 'playing';
       activeRoom.prepSecondsRemaining = 0;
       io.to(roomId).emit('statusChanged', { status: activeRoom.status });
+      // Start eco tick loop now that playing has begun
+      startTickLoop(roomId);
       // No auto-war: attacker manually selects territory to attack
       io.to(roomId).emit('playing:started', {
         message: 'Prep complete! Attacker: click a territory on the map to begin your assault.',
